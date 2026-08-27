@@ -541,14 +541,93 @@ fn test_preview_deposit_rounds_down_end_to_end() {
     assert_eq!(t.vault.preview_withdraw(&3u128), 1);
 }
 
-#[test]
-#[ignore = "upgrade needs a real wasm hash registered in the test env (Storage MissingValue)"]
-fn test_upgrade() {
-    let t = VaultTest::setup();
-    let new_wasm_hash = BytesN::from_array(&t.env, &[1; 32]);
+/// Registers empty Wasm bytes in the test environment and returns the
+/// resulting hash, which can be used as a valid `new_wasm_hash` in upgrade
+/// calls without triggering a Storage MissingValue error.
+fn upload_dummy_wasm(env: &Env) -> BytesN<32> {
+    use soroban_sdk::Bytes;
+    env.deployer().upload_contract_wasm(Bytes::new(env))
+}
 
-    // Admin can upgrade
-    t.vault.upgrade(&new_wasm_hash);
+#[test]
+fn test_upgrade_requires_expected_hash_to_be_staged() {
+    // Calling upgrade without first staging a hash must return WasmHashMismatch.
+    let t = VaultTest::setup();
+    let hash = upload_dummy_wasm(&t.env);
+
+    let res = t.vault.try_upgrade(&hash);
+    assert_eq!(res, Err(Ok(crate::Error::WasmHashMismatch)));
+}
+
+#[test]
+fn test_upgrade_mismatch_is_rejected() {
+    // Stage hash A, then attempt upgrade with hash B — must fail atomically.
+    let t = VaultTest::setup();
+    let correct_hash = upload_dummy_wasm(&t.env);
+    let wrong_hash = BytesN::from_array(&t.env, &[0xde; 32]);
+
+    t.vault.set_expected_wasm_hash(&correct_hash);
+
+    let res = t.vault.try_upgrade(&wrong_hash);
+    assert_eq!(res, Err(Ok(crate::Error::WasmHashMismatch)));
+}
+
+#[test]
+fn test_upgrade_state_preserved_on_mismatch() {
+    // All vault state — including the staged hash — must be unchanged after
+    // a rejected upgrade attempt.
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    t.mint(&user, 1_000);
+    t.vault.deposit(&user, &1_000u128);
+
+    let correct_hash = upload_dummy_wasm(&t.env);
+    t.vault.set_expected_wasm_hash(&correct_hash);
+
+    let wrong_hash = BytesN::from_array(&t.env, &[0xba; 32]);
+    let _ = t.vault.try_upgrade(&wrong_hash);
+
+    // Vault totals unchanged.
+    assert_eq!(t.vault.total_assets(), 1_000);
+    assert_eq!(t.vault.total_shares(), 1_000);
+    assert_eq!(t.vault.balance_of(&user), 1_000);
+    assert_eq!(t.vault.get_admin(), t.admin);
+
+    // The staged hash is still present — a mismatch must not clear it.
+    // Confirm by retrying with the correct hash, which must now succeed.
+    t.vault.upgrade(&correct_hash);
+}
+
+#[test]
+fn test_upgrade_succeeds_with_matching_hash() {
+    // Full happy path: stage then upgrade with the matching hash.
+    let t = VaultTest::setup();
+    let new_hash = upload_dummy_wasm(&t.env);
+
+    t.vault.set_expected_wasm_hash(&new_hash);
+    t.vault.upgrade(&new_hash); // must not error
+}
+
+#[test]
+fn test_set_expected_wasm_hash_without_auth_fails() {
+    // set_expected_wasm_hash must enforce admin authorization.
+    let env = Env::default();
+
+    let admin = Address::generate(&env);
+    let issued = env.register_stellar_asset_contract_v2(admin.clone());
+    let token_address = issued.address();
+
+    let vault_address = env.register(YieldVault, ());
+    let vault = YieldVaultClient::new(&env, &vault_address);
+    vault.initialize(&admin, &token_address);
+
+    // No mock_all_auths — authorization will be denied.
+    let hash = BytesN::from_array(&env, &[0xab; 32]);
+    // Expect the auth failure to panic (same pattern as test_upgrade_without_auth_fails).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        vault.set_expected_wasm_hash(&hash);
+    }));
+    assert!(result.is_err(), "expected panic on missing auth");
 }
 
 // --- #26: saturating math fallbacks for aggregates ------------------------
@@ -858,26 +937,32 @@ fn test_set_admin_event_payload() {
 }
 
 #[test]
-#[ignore = "upgrade needs a real wasm hash registered in the test env (Storage MissingValue)"]
 fn test_upgrade_event_payload() {
     let t = VaultTest::setup();
-    let new_wasm_hash = BytesN::from_array(&t.env, &[1; 32]);
+    let new_wasm_hash = upload_dummy_wasm(&t.env);
 
+    // Stage and then apply the upgrade so an event is emitted.
+    t.vault.set_expected_wasm_hash(&new_wasm_hash);
     t.vault.upgrade(&new_wasm_hash);
 
     let events = t.env.events().all();
     let (contract_id, topics, data) = events.last().unwrap();
 
-    // Contract ID matches vault
+    // Contract ID matches vault.
     assert_eq!(contract_id, t.vault.address);
 
-    // Topic: (Symbol("upgrade"),)
+    // Topics: (Symbol("upgrade"), admin)
     assert!(val_eq(
         &t.env,
         topics.get(0u32).unwrap(),
         soroban_sdk::Symbol::new(&t.env, "upgrade").into_val(&t.env)
     ));
-    assert_eq!(topics.len(), 1);
+    assert!(val_eq(
+        &t.env,
+        topics.get(1u32).unwrap(),
+        t.admin.clone().into_val(&t.env)
+    ));
+    assert_eq!(topics.len(), 2);
 
     // Data: new_wasm_hash
     assert!(val_eq(&t.env, data, new_wasm_hash.into_val(&t.env)));

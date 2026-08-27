@@ -50,8 +50,9 @@ pub fn set_admin(env: &Env, previous: &Address, new_admin: &Address) {
 }
 
 /// Publishes an `upgrade` event recording that the contract's Wasm bytecode
-/// was upgraded to `new_wasm_hash`.
-pub fn upgrade(env: &Env, new_wasm_hash: &BytesN<32>) {
-    let topics = (Symbol::new(env, "upgrade"),);
+/// was upgraded to `new_wasm_hash` by `admin`. The admin address is included
+/// in the topics so indexers can attribute every upgrade to an authority.
+pub fn upgrade(env: &Env, admin: &Address, new_wasm_hash: &BytesN<32>) {
+    let topics = (Symbol::new(env, "upgrade"), admin.clone());
     env.events().publish(topics, new_wasm_hash.clone());
 }

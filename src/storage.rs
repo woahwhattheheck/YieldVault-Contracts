@@ -5,7 +5,7 @@
 //! live in *persistent* storage and are extended on every read and write so
 //! that active users do not have their balances archived.
 
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{Address, BytesN, Env};
 
 use crate::error::Error;
 use crate::types::DataKey;
@@ -146,4 +146,25 @@ pub fn set_balance(env: &Env, user: &Address, balance: u128) {
         PERSISTENT_LIFETIME_THRESHOLD,
         PERSISTENT_BUMP_AMOUNT,
     );
+}
+
+/// Returns the admin-approved expected Wasm hash, if one has been staged.
+pub fn get_expected_wasm_hash(env: &Env) -> Option<BytesN<32>> {
+    env.storage()
+        .instance()
+        .get(&DataKey::ExpectedWasmHash)
+}
+
+/// Stores the admin-approved Wasm hash that the next upgrade must present.
+pub fn set_expected_wasm_hash(env: &Env, hash: &BytesN<32>) {
+    env.storage()
+        .instance()
+        .set(&DataKey::ExpectedWasmHash, hash);
+}
+
+/// Removes the staged expected Wasm hash after a successful upgrade.
+pub fn clear_expected_wasm_hash(env: &Env) {
+    env.storage()
+        .instance()
+        .remove(&DataKey::ExpectedWasmHash);
 }

@@ -338,19 +338,54 @@ impl YieldVault {
         types::VERSION
     }
 
+    /// Stages the Wasm hash that the next [`Self::upgrade`] call must present.
+    ///
+    /// Admin-only: requires authorization from the configured admin address.
+    /// The hash is stored in instance storage and cleared automatically on a
+    /// successful upgrade. Setting a new hash overwrites any previous value,
+    /// giving the admin a safe way to correct a staging mistake before applying
+    /// the upgrade.
+    pub fn set_expected_wasm_hash(env: Env, expected_hash: BytesN<32>) -> Result<(), Error> {
+        storage::require_initialized(&env)?;
+        let admin = storage::get_admin(&env);
+        admin.require_auth();
+
+        storage::set_expected_wasm_hash(&env, &expected_hash);
+        storage::extend_instance(&env);
+        Ok(())
+    }
+
     /// Upgrades the contract's Wasm bytecode to the provided hash.
     ///
     /// Admin-only: requires authorization from the configured admin address.
-    /// Emits an `upgrade` event with the new Wasm hash.
+    ///
+    /// The caller must first call [`Self::set_expected_wasm_hash`] to stage the
+    /// approved hash. This upgrade call then verifies that `new_wasm_hash`
+    /// matches the staged value before invoking the deployer; if the hashes
+    /// differ it returns [`Error::WasmHashMismatch`] and the transaction rolls
+    /// back without touching the contract's Wasm or any other state.
+    ///
+    /// On success the staged hash is cleared and an auditable `upgrade` event
+    /// is emitted that records both the upgrading admin and the new hash.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         storage::require_initialized(&env)?;
         let admin = storage::get_admin(&env);
         admin.require_auth();
 
+        // Verify the artifact against the admin-approved expected hash.
+        // Any mismatch returns an error and the whole transaction is rolled back
+        // atomically — no Wasm swap, no storage mutation, no event.
+        match storage::get_expected_wasm_hash(&env) {
+            Some(ref expected) if expected == &new_wasm_hash => {}
+            _ => return Err(Error::WasmHashMismatch),
+        }
+
+        // Hash verified — apply the upgrade, then clean up the staged value.
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
+        storage::clear_expected_wasm_hash(&env);
         storage::extend_instance(&env);
-        events::upgrade(&env, &new_wasm_hash);
+        events::upgrade(&env, &admin, &new_wasm_hash);
         Ok(())
     }
 }

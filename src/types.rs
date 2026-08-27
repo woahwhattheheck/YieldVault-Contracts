@@ -42,4 +42,7 @@ pub enum DataKey {
     Paused,
     /// A user's share balance, keyed by their address (persistent storage).
     Balance(Address),
+    /// The admin-approved Wasm hash that the next upgrade must present
+    /// (instance storage). Cleared automatically on a successful upgrade.
+    ExpectedWasmHash,
 }

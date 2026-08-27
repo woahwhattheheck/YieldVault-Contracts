@@ -29,4 +29,6 @@ pub enum Error {
     BelowMinimumDeposit = 8,
     /// The vault is paused and is not accepting new deposits.
     Paused = 9,
+    /// The provided Wasm hash does not match the admin-approved expected hash.
+    WasmHashMismatch = 10,
 }
