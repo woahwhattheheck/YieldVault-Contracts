@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- TTL bump budgets for instance and persistent storage: per-entry bump rules,
+  at-most-once dedup within an invocation, and a hard
+  `MAX_TTL_BUMPS_PER_INVOCATION` cap. Documented in `docs/ttl-and-rent.md`
+  with instrumentation tests for redundant-read suppression, read/write
+  coalescing, budget exhaustion, and expired-balance fail-safe withdraws.
+
 ### Changed
 
 - Aggregate totals (`total_shares`, `total_assets`, user balances) now use

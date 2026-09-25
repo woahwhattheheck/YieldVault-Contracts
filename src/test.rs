@@ -1012,3 +1012,185 @@ fn test_event_ordering_deposit_then_withdraw() {
         (500u128, 500u128).into_val(&t.env)
     ));
 }
+
+// ---------------------------------------------------------------------------
+// TTL bump budgets / storage instrumentation (#72)
+// ---------------------------------------------------------------------------
+
+fn advance_ledger(env: &Env, delta: u32) {
+    use soroban_sdk::testutils::Ledger as _;
+    env.ledger().with_mut(|li| {
+        li.sequence_number = li.sequence_number.saturating_add(delta);
+    });
+}
+
+#[test]
+fn test_ttl_repeated_balance_reads_bump_once() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    t.mint(&user, 1_000);
+    t.vault.deposit(&user, &1_000u128);
+
+    // New ledger ⇒ fresh dedup/budget window (guards are sequence-scoped).
+    advance_ledger(&t.env, 1);
+
+    t.env.as_contract(&t.vault.address, || {
+        assert_eq!(crate::storage::ttl_bump_count(&t.env), 0);
+        let b1 = crate::storage::get_balance(&t.env, &user);
+        let b2 = crate::storage::get_balance(&t.env, &user);
+        let b3 = crate::storage::get_balance(&t.env, &user);
+        assert_eq!(b1, 1_000);
+        assert_eq!(b2, 1_000);
+        assert_eq!(b3, 1_000);
+        // Three reads of the same live key → only one extend_ttl.
+        assert_eq!(crate::storage::ttl_bump_count(&t.env), 1);
+    });
+}
+
+#[test]
+fn test_ttl_read_then_write_coalesces_to_one_bump() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    t.mint(&user, 1_000);
+    t.vault.deposit(&user, &1_000u128);
+    advance_ledger(&t.env, 1);
+
+    // Simulate the deposit/withdraw storage pattern: read balance, write balance,
+    // extend instance — must stay within 2 bumps (1 persistent + 1 instance).
+    t.env.as_contract(&t.vault.address, || {
+        assert_eq!(crate::storage::ttl_bump_count(&t.env), 0);
+        let bal = crate::storage::get_balance(&t.env, &user);
+        crate::storage::set_balance(&t.env, &user, bal + 1);
+        crate::storage::extend_instance(&t.env);
+        assert_eq!(crate::storage::ttl_bump_count(&t.env), 2);
+        // Further instance extends are no-ops within the same ledger.
+        crate::storage::extend_instance(&t.env);
+        crate::storage::extend_instance(&t.env);
+        assert_eq!(crate::storage::ttl_bump_count(&t.env), 2);
+    });
+}
+
+#[test]
+fn test_ttl_missing_balance_read_does_not_bump() {
+    let t = VaultTest::setup();
+    let stranger = Address::generate(&t.env);
+    advance_ledger(&t.env, 1);
+
+    t.env.as_contract(&t.vault.address, || {
+        assert_eq!(crate::storage::ttl_bump_count(&t.env), 0);
+        let bal = crate::storage::get_balance(&t.env, &stranger);
+        assert_eq!(bal, 0);
+        // No persistent entry ⇒ no extend_ttl, budget untouched.
+        assert_eq!(crate::storage::ttl_bump_count(&t.env), 0);
+    });
+}
+
+#[test]
+fn test_ttl_budget_caps_bumps_per_invocation() {
+    let t = VaultTest::setup();
+    let cap = crate::storage::MAX_TTL_BUMPS_PER_INVOCATION;
+
+    // Seed more live balances than the bump budget.
+    let mut users = std::vec::Vec::new();
+    for _ in 0..(cap + 4) {
+        let u = Address::generate(&t.env);
+        t.mint(&u, 100);
+        t.vault.deposit(&u, &100u128);
+        users.push(u);
+    }
+    advance_ledger(&t.env, 1);
+
+    t.env.as_contract(&t.vault.address, || {
+        assert_eq!(crate::storage::ttl_bump_count(&t.env), 0);
+        for u in &users {
+            let _ = crate::storage::get_balance(&t.env, u);
+        }
+        assert_eq!(crate::storage::ttl_bump_count(&t.env), cap);
+        // Additional bumps are skipped once the budget is exhausted.
+        crate::storage::extend_instance(&t.env);
+        assert_eq!(crate::storage::ttl_bump_count(&t.env), cap);
+    });
+}
+
+#[test]
+fn test_ttl_budget_resets_on_new_ledger() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    t.mint(&user, 100);
+    t.vault.deposit(&user, &100u128);
+
+    advance_ledger(&t.env, 1);
+    t.env.as_contract(&t.vault.address, || {
+        let _ = crate::storage::get_balance(&t.env, &user);
+        assert_eq!(crate::storage::ttl_bump_count(&t.env), 1);
+    });
+
+    // Next ledger gets a fresh budget window.
+    advance_ledger(&t.env, 1);
+    t.env.as_contract(&t.vault.address, || {
+        assert_eq!(crate::storage::ttl_bump_count(&t.env), 0);
+        let _ = crate::storage::get_balance(&t.env, &user);
+        assert_eq!(crate::storage::ttl_bump_count(&t.env), 1);
+    });
+}
+
+#[test]
+fn test_ttl_expired_balance_withdraw_fails_safe() {
+    // Missing / archived persistent balance reads as 0. A withdraw must not
+    // mutate aggregates.
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+
+    assert_eq!(t.vault.balance_of(&user), 0);
+    assert_eq!(t.vault.total_shares(), 0);
+    assert_eq!(t.vault.total_assets(), 0);
+
+    let res = t.vault.try_withdraw(&user, &1u128);
+    assert_eq!(res, Err(Ok(crate::Error::InsufficientShares)));
+    assert_eq!(t.vault.total_shares(), 0);
+    assert_eq!(t.vault.total_assets(), 0);
+    assert_eq!(t.vault.balance_of(&user), 0);
+}
+
+#[test]
+fn test_ttl_policy_constants_are_internally_consistent() {
+    assert!(crate::storage::INSTANCE_LIFETIME_THRESHOLD < crate::storage::INSTANCE_BUMP_AMOUNT);
+    assert!(crate::storage::PERSISTENT_LIFETIME_THRESHOLD < crate::storage::PERSISTENT_BUMP_AMOUNT);
+    assert_eq!(
+        crate::storage::INSTANCE_BUMP_AMOUNT - crate::storage::INSTANCE_LIFETIME_THRESHOLD,
+        crate::storage::DAY_IN_LEDGERS
+    );
+    assert!(crate::storage::MAX_TTL_BUMPS_PER_INVOCATION >= 2);
+}
+
+#[test]
+fn test_ttl_persistent_ttl_extended_on_active_read() {
+    use crate::types::DataKey;
+    use soroban_sdk::testutils::storage::Persistent as _;
+
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    t.mint(&user, 500);
+    t.vault.deposit(&user, &500u128);
+
+    let key = DataKey::Balance(user.clone());
+    let before = t.env.as_contract(&t.vault.address, || {
+        t.env.storage().persistent().get_ttl(&key)
+    });
+
+    // Advance ledgers so the entry sits below the lifetime threshold, then
+    // touch it via balance_of (which bumps once).
+    let advance = crate::storage::DAY_IN_LEDGERS + 10;
+    advance_ledger(&t.env, advance);
+
+    let _ = t.vault.balance_of(&user);
+
+    let after = t.env.as_contract(&t.vault.address, || {
+        t.env.storage().persistent().get_ttl(&key)
+    });
+
+    // After the bump the remaining TTL should be restored toward the bump
+    // amount, and strictly greater than the pre-touch remaining TTL.
+    assert!(after > before.saturating_sub(advance));
+    assert!(after >= crate::storage::PERSISTENT_LIFETIME_THRESHOLD);
+}
