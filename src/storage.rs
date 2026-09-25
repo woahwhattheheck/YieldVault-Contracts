@@ -118,6 +118,18 @@ pub fn is_paused(env: &Env) -> bool {
         .unwrap_or(false)
 }
 
+/// Returns [`Error::Paused`] when the vault's pause flag is set.
+///
+/// Value-moving entrypoints call this so pause behavior is applied from one
+/// place rather than duplicated with slightly different wording at each site.
+pub fn require_not_paused(env: &Env) -> Result<(), Error> {
+    if is_paused(env) {
+        Err(Error::Paused)
+    } else {
+        Ok(())
+    }
+}
+
 /// Writes the vault's paused flag.
 pub fn set_paused(env: &Env, paused: bool) {
     env.storage().instance().set(&DataKey::Paused, &paused);

@@ -34,11 +34,13 @@ pub fn accrue_yield(env: &Env, amount: u128, total_assets: u128) {
     env.events().publish(topics, (amount, total_assets));
 }
 
-/// Publishes a `paused` event recording the vault's new paused state, so
-/// indexers can track when deposits are halted or resumed.
-pub fn paused(env: &Env, paused: bool) {
-    let topics = (Symbol::new(env, "paused"),);
-    env.events().publish(topics, paused);
+/// Publishes a `paused` event recording the vault's new paused state, the
+/// authorizing `caller`, and a short `reason` symbol so indexers can attribute
+/// emergency halts and resumes.
+pub fn paused(env: &Env, caller: &Address, paused: bool, reason: &Symbol) {
+    let topics = (Symbol::new(env, "paused"), caller.clone());
+    env.events()
+        .publish(topics, (paused, reason.clone()));
 }
 
 /// Publishes a `set_admin` event recording the transfer of the admin role from

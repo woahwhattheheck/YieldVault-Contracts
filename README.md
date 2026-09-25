@@ -37,7 +37,7 @@ of the underlying token.
 | `share_percentage(user)` | A user's share of the vault, in basis points. |
 | `get_apy()` | Advertised APY in basis points. |
 | `is_initialized()` | Whether the vault has been set up. |
-| `is_paused()` | Whether deposits are currently paused. |
+| `is_paused()` | Whether value-moving operations are currently paused. |
 | `version()` | On-chain contract interface version. |
 | `get_min_deposit()` | The smallest accepted deposit amount. |
 | `get_admin()` / `get_token()` | Configuration getters. |
@@ -49,12 +49,14 @@ The configured admin address authorizes the following privileged entrypoints:
 | Function | Description |
 | --- | --- |
 | `accrue_yield(amount)` | Apply mock yield, raising the value of every share. |
-| `set_paused(paused)` | Pause or resume new deposits; withdrawals stay open. |
+| `set_paused(paused, reason)` | Pause or resume all value-moving ops; reason is recorded in the event. |
 | `set_min_deposit(amount)` | Set the minimum accepted deposit amount. |
 | `set_admin(new_admin)` | Transfer the admin role to another address. |
 
-While the vault is paused, `deposit` returns `Paused` but `withdraw` continues
-to work so depositors can always exit their position.
+While the vault is paused, `deposit`, `withdraw`, and `accrue_yield` return
+`Paused`. Read-only getters and administrative recovery paths (`set_paused`,
+`set_admin`, `set_min_deposit`, upgrade staging) remain available so operators
+can inspect state and recover.
 
 ## Architecture
 

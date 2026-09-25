@@ -27,7 +27,7 @@ pub enum Error {
     InsufficientShares = 7,
     /// The deposit amount is below the vault's configured minimum.
     BelowMinimumDeposit = 8,
-    /// The vault is paused and is not accepting new deposits.
+    /// The vault is paused and is rejecting value-moving operations.
     Paused = 9,
     /// The provided Wasm hash does not match the admin-approved expected hash.
     WasmHashMismatch = 10,

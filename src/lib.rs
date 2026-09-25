@@ -20,7 +20,7 @@ mod test;
 
 pub use error::Error;
 
-use soroban_sdk::{contract, contractimpl, contractmeta, token, Address, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, contractmeta, token, Address, BytesN, Env, Symbol};
 
 contractmeta!(
     key = "Description",
@@ -165,23 +165,30 @@ impl YieldVault {
         storage::get_min_deposit(&env)
     }
 
-    /// Returns `true` if the vault is paused for new deposits.
+    /// Returns `true` if the vault is paused for value-moving operations.
     pub fn is_paused(env: Env) -> bool {
         storage::is_paused(&env)
     }
 
-    /// Pauses or resumes the vault's acceptance of new deposits.
+    /// Pauses or resumes every value-moving entrypoint.
     ///
-    /// Withdrawals remain available while paused so depositors can always exit.
-    /// Admin-only: requires authorization from the configured admin address.
-    pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
+    /// While paused, [`Self::deposit`], [`Self::withdraw`], and
+    /// [`Self::accrue_yield`] return [`Error::Paused`]. Read-only getters and
+    /// administrative recovery paths (`set_paused`, `set_admin`,
+    /// `set_min_deposit`, `set_expected_wasm_hash`, `upgrade`) remain available
+    /// so operators can inspect state and recover.
+    ///
+    /// `reason` is a short symbol recorded in the `paused` event (for example
+    /// `incident`, `maintenance`, or `resume`) so indexers can attribute the
+    /// change. Admin-only: requires authorization from the configured admin.
+    pub fn set_paused(env: Env, paused: bool, reason: Symbol) -> Result<(), Error> {
         storage::require_initialized(&env)?;
         let admin = storage::get_admin(&env);
         admin.require_auth();
 
         storage::set_paused(&env, paused);
         storage::extend_instance(&env);
-        events::paused(&env, paused);
+        events::paused(&env, &admin, paused, &reason);
         Ok(())
     }
 
@@ -227,9 +234,7 @@ impl YieldVault {
         storage::require_initialized(&env)?;
         from.require_auth();
 
-        if storage::is_paused(&env) {
-            return Err(Error::Paused);
-        }
+        storage::require_not_paused(&env)?;
         if amount == 0 {
             return Err(Error::ZeroAmount);
         }
@@ -270,6 +275,7 @@ impl YieldVault {
         storage::require_initialized(&env)?;
         from.require_auth();
 
+        storage::require_not_paused(&env)?;
         if shares == 0 {
             return Err(Error::ZeroShares);
         }
@@ -312,6 +318,7 @@ impl YieldVault {
         let admin = storage::get_admin(&env);
         admin.require_auth();
 
+        storage::require_not_paused(&env)?;
         if amount == 0 {
             return Err(Error::ZeroAmount);
         }

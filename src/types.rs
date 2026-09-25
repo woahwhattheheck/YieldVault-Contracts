@@ -10,7 +10,7 @@ use soroban_sdk::{contracttype, Address};
 pub const MOCK_APY_BPS: u32 = 500;
 
 /// The on-chain contract version, bumped on each released interface change.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Fixed-point scale used when reporting the price of a single share, so that
 /// fractional share prices survive integer division (1e9 == one whole asset).
@@ -38,7 +38,7 @@ pub enum DataKey {
     TotalAssets,
     /// The minimum accepted deposit amount (instance storage).
     MinDeposit,
-    /// Whether the vault is paused for new deposits (instance storage).
+    /// Whether the vault is paused for value-moving operations (instance storage).
     Paused,
     /// A user's share balance, keyed by their address (persistent storage).
     Balance(Address),

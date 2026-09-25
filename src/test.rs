@@ -4,7 +4,7 @@ extern crate std;
 
 use soroban_sdk::testutils::{Address as _, Events as _};
 use soroban_sdk::token::{StellarAssetClient, TokenClient};
-use soroban_sdk::{Address, BytesN, Env, IntoVal};
+use soroban_sdk::{Address, BytesN, Env, IntoVal, Symbol};
 
 fn val_eq(env: &soroban_sdk::Env, a: soroban_sdk::Val, b: soroban_sdk::Val) -> bool {
     let va: soroban_sdk::Vec<soroban_sdk::Val> = soroban_sdk::vec![env, a];
@@ -320,7 +320,7 @@ fn test_is_initialized_reflects_setup_state() {
 
     // Now reports initialized and exposes the contract version.
     assert!(vault.is_initialized());
-    assert_eq!(vault.version(), 2);
+    assert_eq!(vault.version(), 3);
 }
 
 #[test]
@@ -353,7 +353,7 @@ fn test_set_admin_transfers_role() {
 }
 
 #[test]
-fn test_pause_blocks_deposit_but_allows_withdraw() {
+fn test_pause_blocks_all_value_moving_ops() {
     let t = VaultTest::setup();
     let user = Address::generate(&t.env);
     t.mint(&user, 2_000);
@@ -361,23 +361,45 @@ fn test_pause_blocks_deposit_but_allows_withdraw() {
     let shares = t.vault.deposit(&user, &1_000u128);
     assert!(!t.vault.is_paused());
 
-    // Admin pauses the vault.
-    t.vault.set_paused(&true);
+    // Admin pauses the vault with an auditable reason.
+    let reason = Symbol::new(&t.env, "incident");
+    t.vault.set_paused(&true, &reason);
     assert!(t.vault.is_paused());
 
-    // New deposits are rejected while paused.
+    // Every value-moving path is rejected while paused.
     let res = t.vault.try_deposit(&user, &1_000u128);
     assert_eq!(res, Err(Ok(crate::Error::Paused)));
+    let res = t.vault.try_withdraw(&user, &shares);
+    assert_eq!(res, Err(Ok(crate::Error::Paused)));
+    let res = t.vault.try_accrue_yield(&500u128);
+    assert_eq!(res, Err(Ok(crate::Error::Paused)));
 
-    // Withdrawals remain available so depositors can always exit.
-    let assets = t.vault.withdraw(&user, &shares);
-    assert_eq!(assets, 1_000);
+    // State is unchanged after the rejected withdraw (atomic fail-closed).
+    assert_eq!(t.vault.balance_of(&user), shares);
+    assert_eq!(t.vault.total_assets(), 1_000);
+    assert_eq!(t.token.balance(&user), 1_000);
 
-    // Resuming the vault re-enables deposits.
-    t.vault.set_paused(&false);
+    // Read-only inspection remains available and does not mutate state.
+    assert_eq!(t.vault.total_shares(), shares);
+    assert_eq!(t.vault.convert_to_assets(&shares), 1_000);
+    assert!(t.vault.is_paused());
+
+    // Admin recovery paths stay available while paused.
+    t.vault.set_min_deposit(&10u128);
+    assert_eq!(t.vault.get_min_deposit(), 10);
+    let new_admin = Address::generate(&t.env);
+    t.vault.set_admin(&new_admin);
+    assert_eq!(t.vault.get_admin(), new_admin);
+
+    // Resuming the vault re-enables value-moving ops.
+    let resume = Symbol::new(&t.env, "resume");
+    // New admin must authorize the unpause after the transfer above.
+    t.vault.set_paused(&false, &resume);
     assert!(!t.vault.is_paused());
     let again = t.vault.deposit(&user, &1_000u128);
     assert_eq!(again, 1_000);
+    let assets = t.vault.withdraw(&user, &shares);
+    assert_eq!(assets, 1_000);
 }
 
 #[test]
@@ -880,7 +902,8 @@ fn test_accrue_yield_event_payload_after_deposit() {
 fn test_paused_event_payload() {
     let t = VaultTest::setup();
 
-    t.vault.set_paused(&true);
+    let reason = Symbol::new(&t.env, "incident");
+    t.vault.set_paused(&true, &reason);
 
     let events = t.env.events().all();
     let (contract_id, topics, data) = events.last().unwrap();
@@ -888,23 +911,73 @@ fn test_paused_event_payload() {
     // Contract ID matches vault
     assert_eq!(contract_id, t.vault.address);
 
-    // Topic: (Symbol("paused"),)
+    // Topic: (Symbol("paused"), admin)
     assert!(val_eq(
         &t.env,
         topics.get(0u32).unwrap(),
-        soroban_sdk::Symbol::new(&t.env, "paused").into_val(&t.env)
+        Symbol::new(&t.env, "paused").into_val(&t.env)
     ));
-    assert_eq!(topics.len(), 1);
+    assert!(val_eq(
+        &t.env,
+        topics.get(1u32).unwrap(),
+        t.admin.clone().into_val(&t.env)
+    ));
+    assert_eq!(topics.len(), 2);
 
-    // Data: true
-    assert!(val_eq(&t.env, data, true.into_val(&t.env)));
+    // Data: (paused=true, reason)
+    assert!(val_eq(
+        &t.env,
+        data,
+        (true, reason.clone()).into_val(&t.env)
+    ));
 
-    // Also test with false value
-    t.vault.set_paused(&false);
+    // Also test resume with a distinct reason.
+    let resume = Symbol::new(&t.env, "resume");
+    t.vault.set_paused(&false, &resume);
 
     let events2 = t.env.events().all();
-    let (_, _, data2) = events2.last().unwrap();
-    assert!(val_eq(&t.env, data2, false.into_val(&t.env)));
+    let (_, topics2, data2) = events2.last().unwrap();
+    assert!(val_eq(
+        &t.env,
+        topics2.get(1u32).unwrap(),
+        t.admin.clone().into_val(&t.env)
+    ));
+    assert!(val_eq(
+        &t.env,
+        data2,
+        (false, resume).into_val(&t.env)
+    ));
+}
+
+#[test]
+fn test_pause_does_not_block_readonly_getters() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    t.mint(&user, 1_000);
+    let shares = t.vault.deposit(&user, &1_000u128);
+
+    t.vault
+        .set_paused(&true, &Symbol::new(&t.env, "maintenance"));
+
+    // Every listed read-only path stays callable and leaves state alone.
+    assert!(t.vault.is_initialized());
+    assert_eq!(t.vault.get_admin(), t.admin);
+    assert_eq!(t.vault.get_token(), t.token.address);
+    assert_eq!(t.vault.total_shares(), shares);
+    assert_eq!(t.vault.total_assets(), 1_000);
+    assert_eq!(t.vault.balance_of(&user), shares);
+    assert_eq!(t.vault.convert_to_shares(&500u128), 500);
+    assert_eq!(t.vault.convert_to_assets(&shares), 1_000);
+    assert_eq!(t.vault.preview_deposit(&500u128), 500);
+    assert_eq!(t.vault.preview_withdraw(&shares), 1_000);
+    assert_eq!(t.vault.max_withdraw(&user), 1_000);
+    assert_eq!(t.vault.max_redeem(&user), shares);
+    assert_eq!(t.vault.share_percentage(&user), 10_000);
+    assert_eq!(t.vault.get_min_deposit(), 1);
+    assert_eq!(t.vault.get_apy(), 500);
+    assert_eq!(t.vault.version(), 3);
+    assert!(t.vault.is_paused());
+    assert_eq!(t.vault.total_assets(), 1_000);
 }
 
 #[test]

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Pause policy now covers every value-moving entrypoint: while paused,
+  `deposit`, `withdraw`, and `accrue_yield` return `Paused`. Read-only getters
+  and administrative recovery paths stay available. `set_paused` takes a
+  `reason` symbol and the `paused` event records caller plus `(paused, reason)`.
+  On-chain `version()` bumped to **3**.
 - Aggregate totals (`total_shares`, `total_assets`, user balances) now use
   saturating arithmetic (`saturating_add`/`saturating_sub`) instead of
   checked arithmetic, per ADR 0026. Overflow caps at `u128::MAX` and
