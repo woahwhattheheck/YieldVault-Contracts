@@ -51,7 +51,10 @@ The configured admin address authorizes the following privileged entrypoints:
 | `accrue_yield(amount)` | Apply mock yield, raising the value of every share. |
 | `set_paused(paused)` | Pause or resume new deposits; withdrawals stay open. |
 | `set_min_deposit(amount)` | Set the minimum accepted deposit amount. |
-| `set_admin(new_admin)` | Transfer the admin role to another address. |
+| `propose_admin(new_admin)` | Stage a two-step admin rotation (7-day TTL). |
+| `accept_admin()` | Pending admin accepts and takes control. |
+| `cancel_admin_proposal()` | Current admin cancels an unaccepted proposal. |
+| `get_pending_admin()` / `get_admin_proposal_expiry()` | Inspect a staged rotation. |
 
 While the vault is paused, `deposit` returns `Paused` but `withdraw` continues
 to work so depositors can always exit their position.

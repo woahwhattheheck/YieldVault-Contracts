@@ -67,19 +67,93 @@ impl YieldVault {
         Ok(storage::get_admin(&env))
     }
 
-    /// Transfers the admin role to `new_admin`.
+    /// Proposes transferring the admin role to `new_admin`.
     ///
-    /// Admin-only: requires authorization from the current admin. Emits a
-    /// `set_admin` event recording the previous and new admin addresses.
-    pub fn set_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+    /// Two-step rotation: the current admin proposes, then `new_admin` must
+    /// call [`Self::accept_admin`] before [`types::ADMIN_PROPOSAL_TTL_SECS`]
+    /// elapses. The current admin can cancel with
+    /// [`Self::cancel_admin_proposal`]. A new proposal overwrites any prior
+    /// unaccepted (or expired) proposal.
+    ///
+    /// Admin-only: requires authorization from the current admin. Emits an
+    /// `admin_proposed` event with the expiry timestamp.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), Error> {
         storage::require_initialized(&env)?;
         let current = storage::get_admin(&env);
         current.require_auth();
 
-        storage::set_admin(&env, &new_admin);
+        if new_admin == current {
+            return Err(Error::InvalidAdminProposal);
+        }
+
+        let now = env.ledger().timestamp();
+        let expires_at = now.saturating_add(types::ADMIN_PROPOSAL_TTL_SECS);
+        storage::set_pending_admin(&env, &new_admin);
+        storage::set_admin_proposal_expiry(&env, expires_at);
         storage::extend_instance(&env);
-        events::set_admin(&env, &current, &new_admin);
+        events::admin_proposed(&env, &current, &new_admin, expires_at);
         Ok(())
+    }
+
+    /// Accepts a pending admin-rotation proposal, transferring the admin role
+    /// to the caller.
+    ///
+    /// Requires authorization from the pending administrator. Rejects expired
+    /// proposals without changing the active admin. Stale proposals remain
+    /// staged until cancelled or overwritten by a new propose.
+    pub fn accept_admin(env: Env) -> Result<(), Error> {
+        storage::require_initialized(&env)?;
+
+        let pending = storage::get_pending_admin(&env).ok_or(Error::NoPendingAdminProposal)?;
+        pending.require_auth();
+
+        let expires_at = storage::get_admin_proposal_expiry(&env)
+            .ok_or(Error::NoPendingAdminProposal)?;
+        let now = env.ledger().timestamp();
+        if now > expires_at {
+            // Do not mutate storage here: returning Err rolls the invocation
+            // back, so a clear would not persist. The stale proposal remains
+            // until the current admin cancels or proposes again.
+            return Err(Error::AdminProposalExpired);
+        }
+
+        let previous = storage::get_admin(&env);
+        storage::set_admin(&env, &pending);
+        storage::clear_admin_proposal(&env);
+        storage::extend_instance(&env);
+        events::admin_accepted(&env, &previous, &pending);
+        Ok(())
+    }
+
+    /// Cancels an unaccepted admin-rotation proposal.
+    ///
+    /// Admin-only: requires authorization from the current (still-active)
+    /// administrator. Leaves the active admin unchanged.
+    pub fn cancel_admin_proposal(env: Env) -> Result<(), Error> {
+        storage::require_initialized(&env)?;
+        let current = storage::get_admin(&env);
+        current.require_auth();
+
+        let pending = storage::get_pending_admin(&env).ok_or(Error::NoPendingAdminProposal)?;
+        storage::clear_admin_proposal(&env);
+        storage::extend_instance(&env);
+        events::admin_proposal_cancelled(&env, &current, &pending);
+        Ok(())
+    }
+
+    /// Returns the pending administrator address, if a proposal is staged.
+    ///
+    /// Does not check expiry; callers should also read
+    /// [`Self::get_admin_proposal_expiry`] when they need to know whether the
+    /// proposal is still acceptable.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        storage::get_pending_admin(&env)
+    }
+
+    /// Returns the unix timestamp when the pending admin proposal expires, if
+    /// one is staged.
+    pub fn get_admin_proposal_expiry(env: Env) -> Option<u64> {
+        storage::get_admin_proposal_expiry(&env)
     }
 
     /// Returns the underlying asset token address.

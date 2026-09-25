@@ -41,12 +41,28 @@ pub fn paused(env: &Env, paused: bool) {
     env.events().publish(topics, paused);
 }
 
-/// Publishes a `set_admin` event recording the transfer of the admin role from
-/// `previous` to `new_admin`.
-pub fn set_admin(env: &Env, previous: &Address, new_admin: &Address) {
-    let topics = (Symbol::new(env, "set_admin"),);
+/// Publishes an `admin_proposed` event recording that `current` proposed
+/// `pending` as the next administrator, with acceptance deadline `expires_at`.
+pub fn admin_proposed(env: &Env, current: &Address, pending: &Address, expires_at: u64) {
+    let topics = (Symbol::new(env, "admin_proposed"),);
+    env.events()
+        .publish(topics, (current.clone(), pending.clone(), expires_at));
+}
+
+/// Publishes an `admin_accepted` event recording that `previous` handed the
+/// admin role to `new_admin` after an explicit acceptance.
+pub fn admin_accepted(env: &Env, previous: &Address, new_admin: &Address) {
+    let topics = (Symbol::new(env, "admin_accepted"),);
     env.events()
         .publish(topics, (previous.clone(), new_admin.clone()));
+}
+
+/// Publishes an `admin_proposal_cancelled` event recording that `admin`
+/// cancelled a pending rotation to `pending`.
+pub fn admin_proposal_cancelled(env: &Env, admin: &Address, pending: &Address) {
+    let topics = (Symbol::new(env, "admin_cancelled"),);
+    env.events()
+        .publish(topics, (admin.clone(), pending.clone()));
 }
 
 /// Publishes an `upgrade` event recording that the contract's Wasm bytecode

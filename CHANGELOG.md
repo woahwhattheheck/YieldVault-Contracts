@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Replace single-step `set_admin` with two-step admin rotation:
+  `propose_admin`, `accept_admin`, `cancel_admin_proposal`, plus pending
+  getters. Proposals expire after 7 days; acceptance after expiry leaves the
+  active admin unchanged (closes #73).
+- Bump on-chain `version()` to 3.
+
+
+### Changed
 
 - Aggregate totals (`total_shares`, `total_assets`, user balances) now use
   saturating arithmetic (`saturating_add`/`saturating_sub`) instead of

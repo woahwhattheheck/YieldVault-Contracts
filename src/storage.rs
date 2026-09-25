@@ -148,6 +148,37 @@ pub fn set_balance(env: &Env, user: &Address, balance: u128) {
     );
 }
 
+
+/// Returns the pending admin address, if a proposal is staged.
+pub fn get_pending_admin(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::PendingAdmin)
+}
+
+/// Writes the pending admin address for a two-step rotation.
+pub fn set_pending_admin(env: &Env, pending: &Address) {
+    env.storage().instance().set(&DataKey::PendingAdmin, pending);
+}
+
+/// Clears any staged admin-rotation proposal (address and expiry).
+pub fn clear_admin_proposal(env: &Env) {
+    env.storage().instance().remove(&DataKey::PendingAdmin);
+    env.storage().instance().remove(&DataKey::AdminProposalExpiry);
+}
+
+/// Returns the proposal expiry timestamp, if set.
+pub fn get_admin_proposal_expiry(env: &Env) -> Option<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::AdminProposalExpiry)
+}
+
+/// Writes the proposal expiry timestamp (ledger unix time).
+pub fn set_admin_proposal_expiry(env: &Env, expires_at: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminProposalExpiry, &expires_at);
+}
+
 /// Returns the admin-approved expected Wasm hash, if one has been staged.
 pub fn get_expected_wasm_hash(env: &Env) -> Option<BytesN<32>> {
     env.storage()

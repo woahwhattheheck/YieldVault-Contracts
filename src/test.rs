@@ -2,7 +2,7 @@
 
 extern crate std;
 
-use soroban_sdk::testutils::{Address as _, Events as _};
+use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
 use soroban_sdk::token::{StellarAssetClient, TokenClient};
 use soroban_sdk::{Address, BytesN, Env, IntoVal};
 
@@ -320,7 +320,7 @@ fn test_is_initialized_reflects_setup_state() {
 
     // Now reports initialized and exposes the contract version.
     assert!(vault.is_initialized());
-    assert_eq!(vault.version(), 2);
+    assert_eq!(vault.version(), 3);
 }
 
 #[test]
@@ -341,15 +341,102 @@ fn test_max_withdraw_matches_share_value() {
 }
 
 #[test]
-fn test_set_admin_transfers_role() {
+fn test_two_step_admin_rotation_requires_acceptance() {
     let t = VaultTest::setup();
     let new_admin = Address::generate(&t.env);
 
     assert_eq!(t.vault.get_admin(), t.admin);
+    assert!(t.vault.get_pending_admin().is_none());
 
-    // Transfer the admin role to a new address.
-    t.vault.set_admin(&new_admin);
+    // Propose alone must not transfer control.
+    t.vault.propose_admin(&new_admin);
+    assert_eq!(t.vault.get_admin(), t.admin);
+    assert_eq!(t.vault.get_pending_admin(), Some(new_admin.clone()));
+    let expiry = t.vault.get_admin_proposal_expiry().expect("expiry set");
+    assert!(expiry > t.env.ledger().timestamp());
+
+    // Acceptance by the pending admin completes the rotation.
+    t.vault.accept_admin();
     assert_eq!(t.vault.get_admin(), new_admin);
+    assert!(t.vault.get_pending_admin().is_none());
+    assert!(t.vault.get_admin_proposal_expiry().is_none());
+}
+
+#[test]
+fn test_cancel_admin_proposal_keeps_current_admin() {
+    let t = VaultTest::setup();
+    let new_admin = Address::generate(&t.env);
+
+    t.vault.propose_admin(&new_admin);
+    assert_eq!(t.vault.get_pending_admin(), Some(new_admin.clone()));
+
+    t.vault.cancel_admin_proposal();
+    assert_eq!(t.vault.get_admin(), t.admin);
+    assert!(t.vault.get_pending_admin().is_none());
+
+    // Accept after cancel must fail closed.
+    let res = t.vault.try_accept_admin();
+    assert_eq!(res, Err(Ok(crate::Error::NoPendingAdminProposal)));
+}
+
+#[test]
+fn test_expired_admin_proposal_is_rejected() {
+    let t = VaultTest::setup();
+    let new_admin = Address::generate(&t.env);
+
+    t.env.ledger().set_timestamp(1_000);
+    t.vault.propose_admin(&new_admin);
+    let expiry = t.vault.get_admin_proposal_expiry().unwrap();
+
+    // Advance past the proposal TTL.
+    t.env.ledger().set_timestamp(expiry + 1);
+
+    let res = t.vault.try_accept_admin();
+    assert_eq!(res, Err(Ok(crate::Error::AdminProposalExpired)));
+    // Active admin unchanged. Stale staging remains until cancel/overwrite
+    // (Err invocations roll back any attempted clear).
+    assert_eq!(t.vault.get_admin(), t.admin);
+    assert_eq!(t.vault.get_pending_admin(), Some(new_admin.clone()));
+
+    // Current admin can recover by cancelling, then a fresh propose works.
+    t.vault.cancel_admin_proposal();
+    assert!(t.vault.get_pending_admin().is_none());
+    let other = Address::generate(&t.env);
+    t.vault.propose_admin(&other);
+    assert_eq!(t.vault.get_pending_admin(), Some(other));
+}
+
+#[test]
+fn test_propose_admin_rejects_self() {
+    let t = VaultTest::setup();
+    let res = t.vault.try_propose_admin(&t.admin);
+    assert_eq!(res, Err(Ok(crate::Error::InvalidAdminProposal)));
+}
+
+#[test]
+fn test_accept_without_proposal_fails() {
+    let t = VaultTest::setup();
+    let res = t.vault.try_accept_admin();
+    assert_eq!(res, Err(Ok(crate::Error::NoPendingAdminProposal)));
+}
+
+#[test]
+fn test_cancel_without_proposal_fails() {
+    let t = VaultTest::setup();
+    let res = t.vault.try_cancel_admin_proposal();
+    assert_eq!(res, Err(Ok(crate::Error::NoPendingAdminProposal)));
+}
+
+#[test]
+fn test_propose_admin_overwrites_prior_proposal() {
+    let t = VaultTest::setup();
+    let first = Address::generate(&t.env);
+    let second = Address::generate(&t.env);
+
+    t.vault.propose_admin(&first);
+    t.vault.propose_admin(&second);
+    assert_eq!(t.vault.get_pending_admin(), Some(second));
+    assert_eq!(t.vault.get_admin(), t.admin);
 }
 
 #[test]
@@ -908,27 +995,75 @@ fn test_paused_event_payload() {
 }
 
 #[test]
-fn test_set_admin_event_payload() {
+fn test_admin_proposed_event_payload() {
     let t = VaultTest::setup();
     let new_admin = Address::generate(&t.env);
 
-    t.vault.set_admin(&new_admin);
+    t.env.ledger().set_timestamp(5_000);
+    t.vault.propose_admin(&new_admin);
 
     let events = t.env.events().all();
     let (contract_id, topics, data) = events.last().unwrap();
-
-    // Contract ID matches vault
     assert_eq!(contract_id, t.vault.address);
 
-    // Topic: (Symbol("set_admin"),)
     assert!(val_eq(
         &t.env,
         topics.get(0u32).unwrap(),
-        soroban_sdk::Symbol::new(&t.env, "set_admin").into_val(&t.env)
+        soroban_sdk::Symbol::new(&t.env, "admin_proposed").into_val(&t.env)
     ));
     assert_eq!(topics.len(), 1);
 
-    // Data: (previous_admin, new_admin)
+    let expires_at = 5_000u64 + crate::types::ADMIN_PROPOSAL_TTL_SECS;
+    assert!(val_eq(
+        &t.env,
+        data,
+        (t.admin.clone(), new_admin.clone(), expires_at).into_val(&t.env)
+    ));
+}
+
+#[test]
+fn test_admin_accepted_event_payload() {
+    let t = VaultTest::setup();
+    let new_admin = Address::generate(&t.env);
+
+    t.vault.propose_admin(&new_admin);
+    t.vault.accept_admin();
+
+    let events = t.env.events().all();
+    let (contract_id, topics, data) = events.last().unwrap();
+    assert_eq!(contract_id, t.vault.address);
+
+    assert!(val_eq(
+        &t.env,
+        topics.get(0u32).unwrap(),
+        soroban_sdk::Symbol::new(&t.env, "admin_accepted").into_val(&t.env)
+    ));
+    assert_eq!(topics.len(), 1);
+    assert!(val_eq(
+        &t.env,
+        data,
+        (t.admin.clone(), new_admin.clone()).into_val(&t.env)
+    ));
+}
+
+#[test]
+fn test_admin_cancelled_event_payload() {
+    let t = VaultTest::setup();
+    let new_admin = Address::generate(&t.env);
+
+    t.vault.propose_admin(&new_admin);
+    t.vault.cancel_admin_proposal();
+
+    let events = t.env.events().all();
+    let (contract_id, topics, data) = events.last().unwrap();
+    assert_eq!(contract_id, t.vault.address);
+
+    assert!(val_eq(
+        &t.env,
+        topics.get(0u32).unwrap(),
+        soroban_sdk::Symbol::new(&t.env, "admin_cancelled").into_val(&t.env)
+    ));
+    assert_eq!(topics.len(), 1);
     assert!(val_eq(
         &t.env,
         data,

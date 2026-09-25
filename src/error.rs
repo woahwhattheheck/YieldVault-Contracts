@@ -31,4 +31,12 @@ pub enum Error {
     Paused = 9,
     /// The provided Wasm hash does not match the admin-approved expected hash.
     WasmHashMismatch = 10,
+    /// No admin-rotation proposal is currently pending.
+    NoPendingAdminProposal = 11,
+    /// The caller is not the pending administrator named in the proposal.
+    NotPendingAdmin = 12,
+    /// The pending admin-rotation proposal has expired.
+    AdminProposalExpired = 13,
+    /// The proposed admin is invalid (zero / same as current admin).
+    InvalidAdminProposal = 14,
 }
