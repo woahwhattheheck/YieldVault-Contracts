@@ -150,9 +150,7 @@ pub fn set_balance(env: &Env, user: &Address, balance: u128) {
 
 /// Returns the admin-approved expected Wasm hash, if one has been staged.
 pub fn get_expected_wasm_hash(env: &Env) -> Option<BytesN<32>> {
-    env.storage()
-        .instance()
-        .get(&DataKey::ExpectedWasmHash)
+    env.storage().instance().get(&DataKey::ExpectedWasmHash)
 }
 
 /// Stores the admin-approved Wasm hash that the next upgrade must present.
@@ -164,7 +162,5 @@ pub fn set_expected_wasm_hash(env: &Env, hash: &BytesN<32>) {
 
 /// Removes the staged expected Wasm hash after a successful upgrade.
 pub fn clear_expected_wasm_hash(env: &Env) {
-    env.storage()
-        .instance()
-        .remove(&DataKey::ExpectedWasmHash);
+    env.storage().instance().remove(&DataKey::ExpectedWasmHash);
 }

@@ -320,7 +320,7 @@ fn test_is_initialized_reflects_setup_state() {
 
     // Now reports initialized and exposes the contract version.
     assert!(vault.is_initialized());
-    assert_eq!(vault.version(), 2);
+    assert_eq!(vault.version(), 3);
 }
 
 #[test]
@@ -718,7 +718,120 @@ fn test_upgrade_without_auth_fails() {
     vault.upgrade(&new_wasm_hash);
 }
 
-// --- #52: event payload content tests ------------------------------------
+// --- #52 / #75: versioned lifecycle event schemas -----------------------
+
+use crate::types::EVENT_SCHEMA_VERSION;
+use soroban_sdk::{Symbol, TryFromVal, Val, Vec};
+
+/// Parsed schema-v1 lifecycle event (deposit / withdraw / yield).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LifecycleEventV1 {
+    kind: Symbol,
+    schema_version: u32,
+    actor: Address,
+    asset: Address,
+    amount_assets: u128,
+    amount_shares: u128,
+    total_assets: u128,
+    total_shares: u128,
+    correlation: u32,
+    outcome: Symbol,
+}
+
+/// Fixture describing an expected lifecycle emission. Used both as the golden
+/// oracle for end-to-end emission tests and as the contract for the parser.
+#[derive(Clone, Debug)]
+struct LifecycleFixture {
+    kind: &'static str,
+    actor: Address,
+    asset: Address,
+    amount_assets: u128,
+    amount_shares: u128,
+    total_assets: u128,
+    total_shares: u128,
+    outcome: &'static str,
+}
+
+fn parse_lifecycle_v1(
+    env: &Env,
+    topics: &Vec<Val>,
+    data: &Val,
+) -> Result<LifecycleEventV1, &'static str> {
+    if topics.len() != 3 {
+        return Err("lifecycle topics must be (kind, schema_version, actor)");
+    }
+    let kind: Symbol =
+        TryFromVal::try_from_val(env, &topics.get(0u32).unwrap()).map_err(|_| "topic[0] kind")?;
+    let schema_version: u32 = TryFromVal::try_from_val(env, &topics.get(1u32).unwrap())
+        .map_err(|_| "topic[1] schema_version")?;
+    let actor: Address =
+        TryFromVal::try_from_val(env, &topics.get(2u32).unwrap()).map_err(|_| "topic[2] actor")?;
+
+    if schema_version != EVENT_SCHEMA_VERSION {
+        return Err("incompatible schema_version");
+    }
+
+    // Check arity via Vec first — TryFromVal on a fixed tuple panics (rather than
+    // returning Err) when the host vector length does not match.
+    let data_vec: Vec<Val> =
+        TryFromVal::try_from_val(env, data).map_err(|_| "data payload arity/types")?;
+    if data_vec.len() != 7 {
+        return Err("data payload arity/types");
+    }
+    let asset: Address = TryFromVal::try_from_val(env, &data_vec.get(0u32).unwrap())
+        .map_err(|_| "data payload arity/types")?;
+    let amount_assets: u128 = TryFromVal::try_from_val(env, &data_vec.get(1u32).unwrap())
+        .map_err(|_| "data payload arity/types")?;
+    let amount_shares: u128 = TryFromVal::try_from_val(env, &data_vec.get(2u32).unwrap())
+        .map_err(|_| "data payload arity/types")?;
+    let total_assets: u128 = TryFromVal::try_from_val(env, &data_vec.get(3u32).unwrap())
+        .map_err(|_| "data payload arity/types")?;
+    let total_shares: u128 = TryFromVal::try_from_val(env, &data_vec.get(4u32).unwrap())
+        .map_err(|_| "data payload arity/types")?;
+    let correlation: u32 = TryFromVal::try_from_val(env, &data_vec.get(5u32).unwrap())
+        .map_err(|_| "data payload arity/types")?;
+    let outcome: Symbol = TryFromVal::try_from_val(env, &data_vec.get(6u32).unwrap())
+        .map_err(|_| "data payload arity/types")?;
+
+    // Reject ambiguous / hidden-unit payloads: amounts are u128 base units and
+    // outcome must be the documented success symbol.
+    if outcome != Symbol::new(env, "ok") {
+        return Err("unknown outcome symbol");
+    }
+
+    Ok(LifecycleEventV1 {
+        kind,
+        schema_version,
+        actor,
+        asset,
+        amount_assets,
+        amount_shares,
+        total_assets,
+        total_shares,
+        correlation,
+        outcome,
+    })
+}
+
+fn assert_matches_fixture(env: &Env, parsed: &LifecycleEventV1, fix: &LifecycleFixture) {
+    assert_eq!(parsed.schema_version, EVENT_SCHEMA_VERSION);
+    assert_eq!(parsed.kind, Symbol::new(env, fix.kind));
+    assert_eq!(parsed.actor, fix.actor);
+    assert_eq!(parsed.asset, fix.asset);
+    assert_eq!(parsed.amount_assets, fix.amount_assets);
+    assert_eq!(parsed.amount_shares, fix.amount_shares);
+    assert_eq!(parsed.total_assets, fix.total_assets);
+    assert_eq!(parsed.total_shares, fix.total_shares);
+    assert_eq!(parsed.outcome, Symbol::new(env, fix.outcome));
+    // Correlation is the ledger sequence at emission.
+    assert_eq!(parsed.correlation, env.ledger().sequence());
+}
+
+fn last_event(env: &Env) -> (Address, Vec<Val>, Val) {
+    let events = env.events().all();
+    let (contract_id, topics, data) = events.last().unwrap();
+    (contract_id, topics, data)
+}
 
 #[test]
 fn test_initialize_event_payload() {
@@ -728,18 +841,13 @@ fn test_initialize_event_payload() {
     // First event emitted should be the init event from VaultTest::setup()
     let (contract_id, topics, data) = events.get(0).unwrap();
 
-    // Contract ID should match the vault address
     assert_eq!(contract_id, t.vault.address);
-
-    // Topic: (Symbol("init"),)
     assert!(val_eq(
         &t.env,
         topics.get(0u32).unwrap(),
-        soroban_sdk::Symbol::new(&t.env, "init").into_val(&t.env)
+        Symbol::new(&t.env, "init").into_val(&t.env)
     ));
     assert_eq!(topics.len(), 1);
-
-    // Data: (admin, token)
     assert!(val_eq(
         &t.env,
         data,
@@ -748,7 +856,7 @@ fn test_initialize_event_payload() {
 }
 
 #[test]
-fn test_deposit_event_payload() {
+fn test_deposit_event_payload_schema_v1() {
     let t = VaultTest::setup();
     let user = Address::generate(&t.env);
     t.mint(&user, 1_000);
@@ -756,35 +864,25 @@ fn test_deposit_event_payload() {
     let shares = t.vault.deposit(&user, &1_000u128);
     assert_eq!(shares, 1_000);
 
-    let events = t.env.events().all();
-    let (contract_id, topics, data) = events.last().unwrap();
-
-    // Contract ID matches vault
+    let (contract_id, topics, data) = last_event(&t.env);
     assert_eq!(contract_id, t.vault.address);
 
-    // Topics: (Symbol("deposit"), user)
-    assert!(val_eq(
-        &t.env,
-        topics.get(0u32).unwrap(),
-        soroban_sdk::Symbol::new(&t.env, "deposit").into_val(&t.env)
-    ));
-    assert!(val_eq(
-        &t.env,
-        topics.get(1u32).unwrap(),
-        user.into_val(&t.env)
-    ));
-    assert_eq!(topics.len(), 2);
-
-    // Data: (assets, shares) = (1_000, 1_000)
-    assert!(val_eq(
-        &t.env,
-        data,
-        (1_000u128, 1_000u128).into_val(&t.env)
-    ));
+    let parsed = parse_lifecycle_v1(&t.env, &topics, &data).expect("deposit schema v1");
+    let fix = LifecycleFixture {
+        kind: "deposit",
+        actor: user.clone(),
+        asset: t.token.address.clone(),
+        amount_assets: 1_000,
+        amount_shares: 1_000,
+        total_assets: 1_000,
+        total_shares: 1_000,
+        outcome: "ok",
+    };
+    assert_matches_fixture(&t.env, &parsed, &fix);
 }
 
 #[test]
-fn test_withdraw_event_payload() {
+fn test_withdraw_event_payload_schema_v1() {
     let t = VaultTest::setup();
     let user = Address::generate(&t.env);
     t.mint(&user, 1_000);
@@ -793,87 +891,136 @@ fn test_withdraw_event_payload() {
     let assets = t.vault.withdraw(&user, &shares);
     assert_eq!(assets, 1_000);
 
-    let events = t.env.events().all();
-    let (contract_id, topics, data) = events.last().unwrap();
-
-    // Contract ID matches vault
+    let (contract_id, topics, data) = last_event(&t.env);
     assert_eq!(contract_id, t.vault.address);
 
-    // Topics: (Symbol("withdraw"), user)
-    assert!(val_eq(
-        &t.env,
-        topics.get(0u32).unwrap(),
-        soroban_sdk::Symbol::new(&t.env, "withdraw").into_val(&t.env)
-    ));
-    assert!(val_eq(
-        &t.env,
-        topics.get(1u32).unwrap(),
-        user.into_val(&t.env)
-    ));
-    assert_eq!(topics.len(), 2);
-
-    // Data: (shares, assets) = (1_000, 1_000)
-    assert!(val_eq(
-        &t.env,
-        data,
-        (1_000u128, 1_000u128).into_val(&t.env)
-    ));
+    let parsed = parse_lifecycle_v1(&t.env, &topics, &data).expect("withdraw schema v1");
+    let fix = LifecycleFixture {
+        kind: "withdraw",
+        actor: user.clone(),
+        asset: t.token.address.clone(),
+        amount_assets: 1_000,
+        amount_shares: 1_000,
+        total_assets: 0,
+        total_shares: 0,
+        outcome: "ok",
+    };
+    assert_matches_fixture(&t.env, &parsed, &fix);
 }
 
 #[test]
-fn test_accrue_yield_event_payload() {
+fn test_accrue_yield_event_payload_schema_v1() {
     let t = VaultTest::setup();
     t.mint(&t.vault.address, 500);
 
     t.vault.accrue_yield(&500u128);
 
-    let events = t.env.events().all();
-    let (contract_id, topics, data) = events.last().unwrap();
-
-    // Contract ID matches vault
+    let (contract_id, topics, data) = last_event(&t.env);
     assert_eq!(contract_id, t.vault.address);
 
-    // Topic: (Symbol("yield"),)
-    assert!(val_eq(
-        &t.env,
-        topics.get(0u32).unwrap(),
-        soroban_sdk::Symbol::new(&t.env, "yield").into_val(&t.env)
-    ));
-    assert_eq!(topics.len(), 1);
-
-    // Data: (amount, total_assets) = (500, 500)
-    assert!(val_eq(&t.env, data, (500u128, 500u128).into_val(&t.env)));
+    let parsed = parse_lifecycle_v1(&t.env, &topics, &data).expect("yield schema v1");
+    let fix = LifecycleFixture {
+        kind: "yield",
+        actor: t.admin.clone(),
+        asset: t.token.address.clone(),
+        amount_assets: 500,
+        amount_shares: 0,
+        total_assets: 500,
+        total_shares: 0,
+        outcome: "ok",
+    };
+    assert_matches_fixture(&t.env, &parsed, &fix);
 }
 
 #[test]
-fn test_accrue_yield_event_payload_after_deposit() {
+fn test_accrue_yield_event_payload_after_deposit_schema_v1() {
     let t = VaultTest::setup();
     let user = Address::generate(&t.env);
     t.mint(&user, 1_000);
 
-    // Deposit first so the vault has existing assets before yield accrual.
     t.vault.deposit(&user, &1_000u128);
-
-    // Fund the vault for the yield transfer and accrue on top of deposits.
     t.mint(&t.vault.address, 500);
     t.vault.accrue_yield(&500u128);
 
-    let events = t.env.events().all();
-    let (contract_id, topics, data) = events.last().unwrap();
+    let (_, topics, data) = last_event(&t.env);
+    let parsed = parse_lifecycle_v1(&t.env, &topics, &data).expect("yield schema v1");
+    let fix = LifecycleFixture {
+        kind: "yield",
+        actor: t.admin.clone(),
+        asset: t.token.address.clone(),
+        amount_assets: 500,
+        amount_shares: 0,
+        total_assets: 1_500,
+        total_shares: 1_000,
+        outcome: "ok",
+    };
+    assert_matches_fixture(&t.env, &parsed, &fix);
+}
 
-    // Contract ID matches vault
-    assert_eq!(contract_id, t.vault.address);
+#[test]
+fn test_fixture_parser_rejects_incompatible_schema_version() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
 
-    // Topic: (Symbol("yield"),)
-    assert!(val_eq(
+    // Synthesize a payload that looks like a deposit but carries schema v999.
+    let bad_topics: Vec<Val> = soroban_sdk::vec![
         &t.env,
-        topics.get(0u32).unwrap(),
-        soroban_sdk::Symbol::new(&t.env, "yield").into_val(&t.env)
-    ));
-    assert_eq!(topics.len(), 1);
+        Symbol::new(&t.env, "deposit").into_val(&t.env),
+        999u32.into_val(&t.env),
+        user.clone().into_val(&t.env),
+    ];
+    let bad_data: Val = (
+        t.token.address.clone(),
+        1_000u128,
+        1_000u128,
+        1_000u128,
+        1_000u128,
+        t.env.ledger().sequence(),
+        Symbol::new(&t.env, "ok"),
+    )
+        .into_val(&t.env);
 
-    // Data: (amount, total_assets) = (500, 1_500) — cumulative figure.
-    assert!(val_eq(&t.env, data, (500u128, 1_500u128).into_val(&t.env)));
+    let err = parse_lifecycle_v1(&t.env, &bad_topics, &bad_data).unwrap_err();
+    assert_eq!(err, "incompatible schema_version");
+}
+
+#[test]
+fn test_fixture_parser_rejects_legacy_two_field_payload() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+
+    // Legacy (pre-#75) deposit: topics (deposit, actor), data (assets, shares).
+    // A v1 parser must fail closed on this incompatible shape.
+    let legacy_topics: Vec<Val> = soroban_sdk::vec![
+        &t.env,
+        Symbol::new(&t.env, "deposit").into_val(&t.env),
+        user.clone().into_val(&t.env),
+    ];
+    let legacy_data: Val = (1_000u128, 1_000u128).into_val(&t.env);
+
+    let err = parse_lifecycle_v1(&t.env, &legacy_topics, &legacy_data).unwrap_err();
+    assert_eq!(
+        err,
+        "lifecycle topics must be (kind, schema_version, actor)"
+    );
+}
+
+#[test]
+fn test_fixture_parser_rejects_wrong_data_arity() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+
+    let topics: Vec<Val> = soroban_sdk::vec![
+        &t.env,
+        Symbol::new(&t.env, "deposit").into_val(&t.env),
+        EVENT_SCHEMA_VERSION.into_val(&t.env),
+        user.clone().into_val(&t.env),
+    ];
+    // Truncated data — missing correlation + outcome (and totals).
+    let truncated: Val = (t.token.address.clone(), 1_000u128, 1_000u128).into_val(&t.env);
+
+    let err = parse_lifecycle_v1(&t.env, &topics, &truncated).unwrap_err();
+    assert_eq!(err, "data payload arity/types");
 }
 
 #[test]
@@ -885,23 +1032,16 @@ fn test_paused_event_payload() {
     let events = t.env.events().all();
     let (contract_id, topics, data) = events.last().unwrap();
 
-    // Contract ID matches vault
     assert_eq!(contract_id, t.vault.address);
-
-    // Topic: (Symbol("paused"),)
     assert!(val_eq(
         &t.env,
         topics.get(0u32).unwrap(),
-        soroban_sdk::Symbol::new(&t.env, "paused").into_val(&t.env)
+        Symbol::new(&t.env, "paused").into_val(&t.env)
     ));
     assert_eq!(topics.len(), 1);
-
-    // Data: true
     assert!(val_eq(&t.env, data, true.into_val(&t.env)));
 
-    // Also test with false value
     t.vault.set_paused(&false);
-
     let events2 = t.env.events().all();
     let (_, _, data2) = events2.last().unwrap();
     assert!(val_eq(&t.env, data2, false.into_val(&t.env)));
@@ -917,18 +1057,13 @@ fn test_set_admin_event_payload() {
     let events = t.env.events().all();
     let (contract_id, topics, data) = events.last().unwrap();
 
-    // Contract ID matches vault
     assert_eq!(contract_id, t.vault.address);
-
-    // Topic: (Symbol("set_admin"),)
     assert!(val_eq(
         &t.env,
         topics.get(0u32).unwrap(),
-        soroban_sdk::Symbol::new(&t.env, "set_admin").into_val(&t.env)
+        Symbol::new(&t.env, "set_admin").into_val(&t.env)
     ));
     assert_eq!(topics.len(), 1);
-
-    // Data: (previous_admin, new_admin)
     assert!(val_eq(
         &t.env,
         data,
@@ -941,21 +1076,17 @@ fn test_upgrade_event_payload() {
     let t = VaultTest::setup();
     let new_wasm_hash = upload_dummy_wasm(&t.env);
 
-    // Stage and then apply the upgrade so an event is emitted.
     t.vault.set_expected_wasm_hash(&new_wasm_hash);
     t.vault.upgrade(&new_wasm_hash);
 
     let events = t.env.events().all();
     let (contract_id, topics, data) = events.last().unwrap();
 
-    // Contract ID matches vault.
     assert_eq!(contract_id, t.vault.address);
-
-    // Topics: (Symbol("upgrade"), admin)
     assert!(val_eq(
         &t.env,
         topics.get(0u32).unwrap(),
-        soroban_sdk::Symbol::new(&t.env, "upgrade").into_val(&t.env)
+        Symbol::new(&t.env, "upgrade").into_val(&t.env)
     ));
     assert!(val_eq(
         &t.env,
@@ -963,52 +1094,72 @@ fn test_upgrade_event_payload() {
         t.admin.clone().into_val(&t.env)
     ));
     assert_eq!(topics.len(), 2);
-
-    // Data: new_wasm_hash
     assert!(val_eq(&t.env, data, new_wasm_hash.into_val(&t.env)));
 }
 
 #[test]
-#[ignore = "event-ordering assertion depends on events().all() accumulation semantics; needs rework"]
-fn test_event_ordering_deposit_then_withdraw() {
+fn test_lifecycle_e2e_deposit_withdraw_yield_fixtures() {
     let t = VaultTest::setup();
     let user = Address::generate(&t.env);
-    t.mint(&user, 1_000);
+    t.mint(&user, 2_000);
 
-    // Clear events after setup to focus on the deposit + withdraw sequence
-    // Note: env.events().all() returns all events emitted so far, so we
-    // track the count and index from there.
-    let events_before = t.env.events().all().len();
+    // Capture after each mutation — `events().all()` may interleave token
+    // transfer events, so we assert against the last vault lifecycle event.
+    t.vault.deposit(&user, &1_000u128);
+    let (_, topics_d, data_d) = last_event(&t.env);
+    let deposit_parsed = parse_lifecycle_v1(&t.env, &topics_d, &data_d).expect("deposit schema v1");
 
-    t.vault.deposit(&user, &500u128);
-    t.vault.withdraw(&user, &500u128);
+    t.mint(&t.vault.address, 250);
+    t.vault.accrue_yield(&250u128);
+    let (_, topics_y, data_y) = last_event(&t.env);
+    let yield_parsed = parse_lifecycle_v1(&t.env, &topics_y, &data_y).expect("yield schema v1");
 
-    let events = t.env.events().all();
-    let (_, deposit_topics, deposit_data) = events.get(events_before).unwrap();
-    let (_, withdraw_topics, withdraw_data) = events.get(events_before + 1).unwrap();
+    let redeemed = t.vault.withdraw(&user, &500u128);
+    assert_eq!(redeemed, 625); // 500 shares of 1_250 assets / 1_000 shares
+    let (_, topics_w, data_w) = last_event(&t.env);
+    let withdraw_parsed =
+        parse_lifecycle_v1(&t.env, &topics_w, &data_w).expect("withdraw schema v1");
 
-    // Deposit event topic
-    assert!(val_eq(
+    assert_matches_fixture(
         &t.env,
-        deposit_topics.get(0u32).unwrap(),
-        soroban_sdk::Symbol::new(&t.env, "deposit").into_val(&t.env)
-    ));
-    // Withdraw event topic
-    assert!(val_eq(
+        &deposit_parsed,
+        &LifecycleFixture {
+            kind: "deposit",
+            actor: user.clone(),
+            asset: t.token.address.clone(),
+            amount_assets: 1_000,
+            amount_shares: 1_000,
+            total_assets: 1_000,
+            total_shares: 1_000,
+            outcome: "ok",
+        },
+    );
+    assert_matches_fixture(
         &t.env,
-        withdraw_topics.get(0u32).unwrap(),
-        soroban_sdk::Symbol::new(&t.env, "withdraw").into_val(&t.env)
-    ));
-    // Deposit data: (assets, shares) = (500, 500)
-    assert!(val_eq(
+        &yield_parsed,
+        &LifecycleFixture {
+            kind: "yield",
+            actor: t.admin.clone(),
+            asset: t.token.address.clone(),
+            amount_assets: 250,
+            amount_shares: 0,
+            total_assets: 1_250,
+            total_shares: 1_000,
+            outcome: "ok",
+        },
+    );
+    assert_matches_fixture(
         &t.env,
-        deposit_data,
-        (500u128, 500u128).into_val(&t.env)
-    ));
-    // Withdraw data: (shares, assets) = (500, 500)
-    assert!(val_eq(
-        &t.env,
-        withdraw_data,
-        (500u128, 500u128).into_val(&t.env)
-    ));
+        &withdraw_parsed,
+        &LifecycleFixture {
+            kind: "withdraw",
+            actor: user.clone(),
+            asset: t.token.address.clone(),
+            amount_assets: 625,
+            amount_shares: 500,
+            total_assets: 625,
+            total_shares: 500,
+            outcome: "ok",
+        },
+    );
 }

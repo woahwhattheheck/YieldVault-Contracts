@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Versioned lifecycle event schemas for `deposit`, `withdraw`, and `yield`
+  (`EVENT_SCHEMA_VERSION = 1`): topics `(kind, schema_version, actor)` and data
+  `(asset, amount_assets, amount_shares, total_assets, total_shares, correlation,
+  outcome)` with explicit base-unit semantics. Fixture parser tests reject
+  incompatible schema versions and legacy payloads. See `docs/event-reference.md`
+  and ADR 0042. On-chain `version()` bumped to 3.
+
 ### Changed
 
 - Aggregate totals (`total_shares`, `total_assets`, user balances) now use

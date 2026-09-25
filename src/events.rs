@@ -1,23 +1,119 @@
-//! Event publishing helpers for the YieldVault.
+//! Versioned event publishing helpers for the YieldVault.
 //!
-//! Each helper publishes a topic identifying the event kind (and, where
-//! relevant, the affected account) together with a data payload of the amounts
-//! involved, so off-chain indexers can track vault activity.
+//! Lifecycle events (`deposit`, `withdraw`, `yield`) emit a documented schema
+//! so indexers can evolve safely. Schema layout:
+//!
+//! ## Topics (all lifecycle events)
+//!
+//! `(kind: Symbol, schema_version: u32, actor: Address)`
+//!
+//! - `kind` — `"deposit"`, `"withdraw"`, or `"yield"`
+//! - `schema_version` — [`types::EVENT_SCHEMA_VERSION`]; bump when field
+//!   meanings or order change incompatibly
+//! - `actor` — the authorizing party (depositor, withdrawer, or admin)
+//!
+//! ## Data payload (schema v1)
+//!
+//! `(asset, amount_assets, amount_shares, total_assets, total_shares, correlation, outcome)`
+//!
+//! | Field | Type | Units / meaning |
+//! | --- | --- | --- |
+//! | `asset` | `Address` | Underlying SEP-41 token contract |
+//! | `amount_assets` | `u128` | Underlying token **base units** (no hidden scale) |
+//! | `amount_shares` | `u128` | Vault share units (no hidden scale) |
+//! | `total_assets` | `u128` | Vault aggregate assets after the mutation |
+//! | `total_shares` | `u128` | Vault aggregate shares after the mutation |
+//! | `correlation` | `u32` | Ledger sequence at emission (reconstruction key) |
+//! | `outcome` | `Symbol` | `"ok"` on successful emission (reverts emit nothing) |
+//!
+//! Kind-specific semantics for the amount fields:
+//! - **deposit** — `amount_assets` deposited, `amount_shares` minted
+//! - **withdraw** — `amount_shares` burned, `amount_assets` redeemed
+//! - **yield** — `amount_assets` credited as yield, `amount_shares` = 0
+//!
+//! Admin / control events (`init`, `paused`, `set_admin`, `upgrade`) keep their
+//! existing compact payloads; they are not part of the versioned lifecycle
+//! schema.
 
 use soroban_sdk::{Address, BytesN, Env, Symbol};
 
-/// Publishes a `deposit` event recording that `from` supplied `assets` of the
-/// underlying token in exchange for `shares` vault shares.
-pub fn deposit(env: &Env, from: &Address, assets: u128, shares: u128) {
-    let topics = (Symbol::new(env, "deposit"), from.clone());
-    env.events().publish(topics, (assets, shares));
+use crate::types;
+
+/// Outcome symbol published on every successful lifecycle event.
+pub fn outcome_ok(env: &Env) -> Symbol {
+    Symbol::new(env, "ok")
 }
 
-/// Publishes a `withdraw` event recording that `from` burned `shares` vault
-/// shares to redeem `assets` of the underlying token.
-pub fn withdraw(env: &Env, from: &Address, shares: u128, assets: u128) {
-    let topics = (Symbol::new(env, "withdraw"), from.clone());
-    env.events().publish(topics, (shares, assets));
+fn publish_lifecycle(
+    env: &Env,
+    kind: &str,
+    actor: &Address,
+    asset: &Address,
+    amount_assets: u128,
+    amount_shares: u128,
+    total_assets: u128,
+    total_shares: u128,
+) {
+    let topics = (
+        Symbol::new(env, kind),
+        types::EVENT_SCHEMA_VERSION,
+        actor.clone(),
+    );
+    let correlation = env.ledger().sequence();
+    let data = (
+        asset.clone(),
+        amount_assets,
+        amount_shares,
+        total_assets,
+        total_shares,
+        correlation,
+        outcome_ok(env),
+    );
+    env.events().publish(topics, data);
+}
+
+/// Publishes a versioned `deposit` lifecycle event.
+pub fn deposit(
+    env: &Env,
+    from: &Address,
+    asset: &Address,
+    assets: u128,
+    shares: u128,
+    total_assets: u128,
+    total_shares: u128,
+) {
+    publish_lifecycle(
+        env,
+        "deposit",
+        from,
+        asset,
+        assets,
+        shares,
+        total_assets,
+        total_shares,
+    );
+}
+
+/// Publishes a versioned `withdraw` lifecycle event.
+pub fn withdraw(
+    env: &Env,
+    from: &Address,
+    asset: &Address,
+    shares: u128,
+    assets: u128,
+    total_assets: u128,
+    total_shares: u128,
+) {
+    publish_lifecycle(
+        env,
+        "withdraw",
+        from,
+        asset,
+        assets,
+        shares,
+        total_assets,
+        total_shares,
+    );
 }
 
 /// Publishes an `init` event recording the configured `admin` and underlying
@@ -27,11 +123,25 @@ pub fn initialize(env: &Env, admin: &Address, token: &Address) {
     env.events().publish(topics, (admin.clone(), token.clone()));
 }
 
-/// Publishes a `yield` event recording the `amount` of assets accrued to the
-/// vault as mock yield, alongside the new total assets figure.
-pub fn accrue_yield(env: &Env, amount: u128, total_assets: u128) {
-    let topics = (Symbol::new(env, "yield"),);
-    env.events().publish(topics, (amount, total_assets));
+/// Publishes a versioned `yield` lifecycle event.
+pub fn accrue_yield(
+    env: &Env,
+    actor: &Address,
+    asset: &Address,
+    amount: u128,
+    total_assets: u128,
+    total_shares: u128,
+) {
+    publish_lifecycle(
+        env,
+        "yield",
+        actor,
+        asset,
+        amount,
+        0,
+        total_assets,
+        total_shares,
+    );
 }
 
 /// Publishes a `paused` event recording the vault's new paused state, so
