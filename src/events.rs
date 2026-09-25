@@ -27,11 +27,33 @@ pub fn initialize(env: &Env, admin: &Address, token: &Address) {
     env.events().publish(topics, (admin.clone(), token.clone()));
 }
 
-/// Publishes a `yield` event recording the `amount` of assets accrued to the
-/// vault as mock yield, alongside the new total assets figure.
-pub fn accrue_yield(env: &Env, amount: u128, total_assets: u128) {
+/// Publishes a `yield` event recording the `amount` of assets accrued, the new
+/// `total_assets`, the accrual boundary `accrued_at`, and the `rate_version`
+/// that was in force for the interval.
+pub fn accrue_yield(
+    env: &Env,
+    amount: u128,
+    total_assets: u128,
+    accrued_at: u64,
+    rate_version: u32,
+) {
     let topics = (Symbol::new(env, "yield"),);
-    env.events().publish(topics, (amount, total_assets));
+    env.events()
+        .publish(topics, (amount, total_assets, accrued_at, rate_version));
+}
+
+/// Publishes a `rate` event recording that the annual yield rate changed to
+/// `rate_bps` at configuration `rate_version`, effective from `effective_at`
+/// (the accrual boundary at which the prior rate stopped applying).
+pub fn yield_rate_changed(
+    env: &Env,
+    rate_bps: u32,
+    rate_version: u32,
+    effective_at: u64,
+) {
+    let topics = (Symbol::new(env, "rate"),);
+    env.events()
+        .publish(topics, (rate_bps, rate_version, effective_at));
 }
 
 /// Publishes a `paused` event recording the vault's new paused state, so

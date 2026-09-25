@@ -87,3 +87,27 @@ pub fn convert_to_assets(
     }
     mul_div(shares, total_assets, total_shares)
 }
+
+/// Computes simple (non-compounding) yield for `assets` over `elapsed_secs` at
+/// an annual rate of `rate_bps` basis points.
+///
+/// Formula: `assets * rate_bps * elapsed_secs / (BPS_DENOMINATOR * SECONDS_PER_YEAR)`,
+/// rounding down. Returns zero when any input factor is zero. Intermediate
+/// products use checked multiplication so overflow returns
+/// [`Error::MathOverflow`] rather than wrapping.
+pub fn simple_yield(assets: u128, rate_bps: u32, elapsed_secs: u64) -> Result<u128, Error> {
+    if assets == 0 || rate_bps == 0 || elapsed_secs == 0 {
+        return Ok(0);
+    }
+    let rate = u128::from(rate_bps);
+    let elapsed = u128::from(elapsed_secs);
+    let numerator = assets
+        .checked_mul(rate)
+        .ok_or(Error::MathOverflow)?
+        .checked_mul(elapsed)
+        .ok_or(Error::MathOverflow)?;
+    let denominator = crate::types::BPS_DENOMINATOR
+        .checked_mul(u128::from(crate::types::SECONDS_PER_YEAR))
+        .ok_or(Error::MathOverflow)?;
+    Ok(numerator / denominator)
+}

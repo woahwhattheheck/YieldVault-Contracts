@@ -2,7 +2,7 @@
 
 extern crate std;
 
-use soroban_sdk::testutils::{Address as _, Events as _};
+use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
 use soroban_sdk::token::{StellarAssetClient, TokenClient};
 use soroban_sdk::{Address, BytesN, Env, IntoVal};
 
@@ -53,6 +53,36 @@ impl<'a> VaultTest<'a> {
     /// Mints `amount` of the underlying token to `user`.
     fn mint(&self, user: &Address, amount: i128) {
         self.token_admin.mint(user, &amount);
+    }
+
+    /// Credits exactly `amount` of simple yield by pinning the rate at 100% APY
+    /// and advancing the ledger timestamp by `amount * YEAR / assets` seconds.
+    ///
+    /// Requires a non-zero `total_assets` and that `amount * YEAR` is divisible
+    /// by `assets` so the floored simple-interest formula matches exactly.
+    fn credit_yield(&self, amount: u128) {
+        let assets = self.vault.total_assets();
+        assert!(assets > 0, "credit_yield requires non-zero total_assets");
+        let year = u128::from(crate::types::SECONDS_PER_YEAR);
+        assert_eq!(
+            (amount * year) % assets,
+            0,
+            "credit_yield amount must divide evenly for assets={assets}"
+        );
+        let elapsed = (amount * year) / assets;
+        assert!(
+            elapsed <= u128::from(crate::types::MAX_ACCRUAL_INTERVAL_SECS),
+            "credit_yield elapsed exceeds max accrual interval"
+        );
+
+        // Settle any open interval at the current rate with zero elapsed, then
+        // switch to 100% APY so the subsequent advance credits exactly `amount`.
+        let last = self.vault.get_last_accrued_at();
+        self.env.ledger().set_timestamp(last);
+        self.vault.set_yield_rate(&10_000u32);
+        self.env.ledger().set_timestamp(last + elapsed as u64);
+        let got = self.vault.accrue_yield();
+        assert_eq!(got, amount);
     }
 }
 
@@ -127,7 +157,7 @@ fn test_yield_increases_share_value() {
     // Admin accrues 1_000 of mock yield, doubling assets without new shares.
     // Fund the vault so the eventual withdrawal can actually transfer out.
     t.mint(&t.vault.address, 1_000);
-    t.vault.accrue_yield(&1_000u128);
+    t.credit_yield(1_000);
 
     assert_eq!(t.vault.total_assets(), 2_000);
     assert_eq!(t.vault.total_shares(), 1_000);
@@ -146,7 +176,7 @@ fn test_deposit_yield_withdraw_round_trip() {
     let shares = t.vault.deposit(&user, &1_000u128);
 
     t.mint(&t.vault.address, 500);
-    t.vault.accrue_yield(&500u128);
+    t.credit_yield(500);
 
     let assets = t.vault.withdraw(&user, &shares);
 
@@ -170,7 +200,7 @@ fn test_second_depositor_gets_fewer_shares_after_yield() {
 
     // Yield doubles the share price before Bob deposits.
     t.mint(&t.vault.address, 1_000);
-    t.vault.accrue_yield(&1_000u128);
+    t.credit_yield(1_000);
 
     // Bob deposits the same assets but, since each share is now worth more,
     // receives half as many shares as Alice did.
@@ -251,7 +281,7 @@ fn test_price_per_share_view_tracks_yield() {
 
     // Accrued yield doubles assets, so each share is worth twice as much.
     t.mint(&t.vault.address, 1_000);
-    t.vault.accrue_yield(&1_000u128);
+    t.credit_yield(1_000);
     assert_eq!(t.vault.price_per_share(), 2_000_000_000);
 }
 
@@ -320,7 +350,7 @@ fn test_is_initialized_reflects_setup_state() {
 
     // Now reports initialized and exposes the contract version.
     assert!(vault.is_initialized());
-    assert_eq!(vault.version(), 2);
+    assert_eq!(vault.version(), 3);
 }
 
 #[test]
@@ -334,7 +364,7 @@ fn test_max_withdraw_matches_share_value() {
     assert_eq!(t.vault.max_withdraw(&user), 1_000);
 
     t.mint(&t.vault.address, 500);
-    t.vault.accrue_yield(&500u128);
+    t.credit_yield(500);
 
     // After yield the redeemable amount grows with the share price.
     assert_eq!(t.vault.max_withdraw(&user), 1_500);
@@ -456,7 +486,7 @@ fn test_max_redeem_returns_share_balance() {
 
     // Yield grows the asset value but leaves the redeemable share count fixed.
     t.mint(&t.vault.address, 500);
-    t.vault.accrue_yield(&500u128);
+    t.credit_yield(500);
     assert_eq!(t.vault.max_redeem(&user), shares);
     assert_eq!(t.vault.max_withdraw(&user), 1_500);
 }
@@ -633,19 +663,30 @@ fn test_set_expected_wasm_hash_without_auth_fails() {
 // --- #26: saturating math fallbacks for aggregates ------------------------
 
 #[test]
-fn test_saturating_add_caps_at_max_for_total_assets() {
+fn test_accrue_yield_overflow_fails_closed() {
     let t = VaultTest::setup();
     let user = Address::generate(&t.env);
     t.mint(&user, 1_000);
-
-    // Seed a deposit so totals are non-zero.
     t.vault.deposit(&user, &1_000u128);
-    assert_eq!(t.vault.total_assets(), 1_000);
 
-    // accrue_yield uses saturating_add on the aggregate. Adding u128::MAX
-    // would overflow, so the result saturates at u128::MAX.
-    t.vault.accrue_yield(&u128::MAX);
-    assert_eq!(t.vault.total_assets(), u128::MAX);
+    // Math overflow in the simple-yield product fails closed.
+    assert_eq!(
+        crate::math::simple_yield(u128::MAX, 10_000, crate::types::SECONDS_PER_YEAR),
+        Err(crate::Error::MathOverflow)
+    );
+
+    // Establish a non-zero accrual boundary, then regress the clock.
+    t.env.ledger().set_timestamp(10_000);
+    assert_eq!(t.vault.accrue_yield(), 0); // advances boundary with zero credit at 5% over short gap from 0
+    // Re-pin a known boundary for a clean regression check.
+    let last = t.vault.get_last_accrued_at();
+    assert!(last > 0);
+    let assets_before = t.vault.total_assets();
+    t.env.ledger().set_timestamp(last - 1);
+    let res = t.vault.try_accrue_yield();
+    assert_eq!(res, Err(Ok(crate::Error::TimestampRegression)));
+    assert_eq!(t.vault.total_assets(), assets_before);
+    assert_eq!(t.vault.get_last_accrued_at(), last);
 }
 
 #[test]
@@ -679,23 +720,21 @@ fn test_saturating_sub_floors_total_shares_on_withdraw() {
 }
 
 #[test]
-fn test_multiple_accrue_yield_saturates() {
+fn test_repeated_accrue_same_timestamp_is_noop() {
     let t = VaultTest::setup();
     let user = Address::generate(&t.env);
     t.mint(&user, 1_000);
     t.vault.deposit(&user, &1_000u128);
 
-    // Multiple large yield accruals each saturate the aggregate at MAX.
-    t.vault.accrue_yield(&(u128::MAX - 500));
-    assert_eq!(t.vault.total_assets(), u128::MAX);
+    t.credit_yield(500);
+    assert_eq!(t.vault.total_assets(), 1_500);
+    let last = t.vault.get_last_accrued_at();
 
-    // Adding more yield stays capped at MAX.
-    t.vault.accrue_yield(&1_000u128);
-    assert_eq!(t.vault.total_assets(), u128::MAX);
-
-    // A third accrual also stays at MAX.
-    t.vault.accrue_yield(&u128::MAX);
-    assert_eq!(t.vault.total_assets(), u128::MAX);
+    // A second call in the same ledger second must not double-credit.
+    let again = t.vault.accrue_yield();
+    assert_eq!(again, 0);
+    assert_eq!(t.vault.total_assets(), 1_500);
+    assert_eq!(t.vault.get_last_accrued_at(), last);
 }
 
 #[test]
@@ -823,17 +862,24 @@ fn test_withdraw_event_payload() {
 #[test]
 fn test_accrue_yield_event_payload() {
     let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    t.mint(&user, 1_000);
+    t.vault.deposit(&user, &1_000u128);
     t.mint(&t.vault.address, 500);
 
-    t.vault.accrue_yield(&500u128);
+    // Pin 100% APY at the current boundary (no elapsed), then accrue half a year.
+    let last = t.vault.get_last_accrued_at();
+    t.env.ledger().set_timestamp(last);
+    t.vault.set_yield_rate(&10_000u32);
+    let rate_version = t.vault.get_yield_rate_version();
+    let accrued_at = last + crate::types::SECONDS_PER_YEAR / 2;
+    t.env.ledger().set_timestamp(accrued_at);
+    assert_eq!(t.vault.accrue_yield(), 500);
 
     let events = t.env.events().all();
-    let (contract_id, topics, data) = events.last().unwrap();
+    let (contract_id, topics, data) = events.last().expect("yield event");
 
-    // Contract ID matches vault
     assert_eq!(contract_id, t.vault.address);
-
-    // Topic: (Symbol("yield"),)
     assert!(val_eq(
         &t.env,
         topics.get(0u32).unwrap(),
@@ -841,8 +887,12 @@ fn test_accrue_yield_event_payload() {
     ));
     assert_eq!(topics.len(), 1);
 
-    // Data: (amount, total_assets) = (500, 500)
-    assert!(val_eq(&t.env, data, (500u128, 500u128).into_val(&t.env)));
+    // Data: (amount, total_assets, accrued_at, rate_version)
+    assert!(val_eq(
+        &t.env,
+        data,
+        (500u128, 1_500u128, accrued_at, rate_version).into_val(&t.env)
+    ));
 }
 
 #[test]
@@ -854,17 +904,20 @@ fn test_accrue_yield_event_payload_after_deposit() {
     // Deposit first so the vault has existing assets before yield accrual.
     t.vault.deposit(&user, &1_000u128);
 
-    // Fund the vault for the yield transfer and accrue on top of deposits.
-    t.mint(&t.vault.address, 500);
-    t.vault.accrue_yield(&500u128);
+    // Fund the vault for the eventual withdrawal coverage and accrue a full year.
+    t.mint(&t.vault.address, 1_000);
+    let last = t.vault.get_last_accrued_at();
+    t.env.ledger().set_timestamp(last);
+    t.vault.set_yield_rate(&10_000u32);
+    let rate_version = t.vault.get_yield_rate_version();
+    let accrued_at = last + crate::types::SECONDS_PER_YEAR;
+    t.env.ledger().set_timestamp(accrued_at);
+    assert_eq!(t.vault.accrue_yield(), 1_000);
 
     let events = t.env.events().all();
-    let (contract_id, topics, data) = events.last().unwrap();
+    let (contract_id, topics, data) = events.last().expect("yield event");
 
-    // Contract ID matches vault
     assert_eq!(contract_id, t.vault.address);
-
-    // Topic: (Symbol("yield"),)
     assert!(val_eq(
         &t.env,
         topics.get(0u32).unwrap(),
@@ -872,8 +925,12 @@ fn test_accrue_yield_event_payload_after_deposit() {
     ));
     assert_eq!(topics.len(), 1);
 
-    // Data: (amount, total_assets) = (500, 1_500) — cumulative figure.
-    assert!(val_eq(&t.env, data, (500u128, 1_500u128).into_val(&t.env)));
+    // Data: (amount, total_assets, accrued_at, rate_version) — cumulative assets.
+    assert!(val_eq(
+        &t.env,
+        data,
+        (1_000u128, 2_000u128, accrued_at, rate_version).into_val(&t.env)
+    ));
 }
 
 #[test]
@@ -1010,5 +1067,112 @@ fn test_event_ordering_deposit_then_withdraw() {
         &t.env,
         withdraw_data,
         (500u128, 500u128).into_val(&t.env)
+    ));
+}
+
+
+// --- #70: bounded yield accrual with rate + timestamp semantics ------------
+
+#[test]
+fn test_initialize_seeds_accrual_clock() {
+    let t = VaultTest::setup();
+    assert_eq!(t.vault.get_yield_rate(), 500);
+    assert_eq!(t.vault.get_apy(), 500);
+    assert_eq!(t.vault.get_yield_rate_version(), 1);
+    assert_eq!(t.vault.get_last_accrued_at(), t.env.ledger().timestamp());
+    assert_eq!(t.vault.version(), 3);
+}
+
+#[test]
+fn test_simple_yield_math_boundaries() {
+    use crate::math::simple_yield;
+    use crate::types::{MAX_ACCRUAL_INTERVAL_SECS, SECONDS_PER_YEAR};
+
+    // Zero factors short-circuit to zero.
+    assert_eq!(simple_yield(0, 10_000, SECONDS_PER_YEAR), Ok(0));
+    assert_eq!(simple_yield(1_000, 0, SECONDS_PER_YEAR), Ok(0));
+    assert_eq!(simple_yield(1_000, 10_000, 0), Ok(0));
+
+    // 100% APY over one year credits +100% of principal.
+    assert_eq!(simple_yield(1_000, 10_000, SECONDS_PER_YEAR), Ok(1_000));
+    // 5% APY over one year.
+    assert_eq!(simple_yield(10_000, 500, SECONDS_PER_YEAR), Ok(500));
+    // Half-year at 100% APY.
+    assert_eq!(simple_yield(1_000, 10_000, SECONDS_PER_YEAR / 2), Ok(500));
+
+    // Max interval constant matches one year.
+    assert_eq!(MAX_ACCRUAL_INTERVAL_SECS, SECONDS_PER_YEAR);
+}
+
+#[test]
+fn test_accrual_clamps_to_max_interval() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    t.mint(&user, 1_000);
+    t.vault.deposit(&user, &1_000u128);
+
+    // Pin 100% APY with zero elapsed, then jump two years — clamp credits one year.
+    let last = t.vault.get_last_accrued_at();
+    t.env.ledger().set_timestamp(last);
+    t.vault.set_yield_rate(&10_000u32);
+    t.env.ledger().set_timestamp(last + 2 * crate::types::SECONDS_PER_YEAR);
+    let credited = t.vault.accrue_yield();
+    assert_eq!(credited, 1_000);
+    assert_eq!(t.vault.total_assets(), 2_000);
+}
+
+#[test]
+fn test_set_yield_rate_applies_at_boundary() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    t.mint(&user, 10_000);
+    t.vault.deposit(&user, &10_000u128);
+
+    // One year at the default 5% APY credits 500, then the rate switches to 10%.
+    let last = t.vault.get_last_accrued_at();
+    t.env.ledger().set_timestamp(last + crate::types::SECONDS_PER_YEAR);
+    let accrued = t.vault.set_yield_rate(&1_000u32);
+    assert_eq!(accrued, 500);
+    assert_eq!(t.vault.total_assets(), 10_500);
+    assert_eq!(t.vault.get_yield_rate(), 1_000);
+    assert_eq!(t.vault.get_yield_rate_version(), 2);
+    assert_eq!(t.vault.get_last_accrued_at(), last + crate::types::SECONDS_PER_YEAR);
+
+    // Subsequent year at the new 10% rate credits 1_050 on the new principal.
+    let boundary = t.vault.get_last_accrued_at();
+    t.env.ledger().set_timestamp(boundary + crate::types::SECONDS_PER_YEAR);
+    let credited = t.vault.accrue_yield();
+    assert_eq!(credited, 1_050);
+    assert_eq!(t.vault.total_assets(), 11_550);
+}
+
+#[test]
+fn test_set_yield_rate_rejects_too_high() {
+    let t = VaultTest::setup();
+    let res = t.vault.try_set_yield_rate(&(crate::types::MAX_YIELD_RATE_BPS + 1));
+    assert_eq!(res, Err(Ok(crate::Error::YieldRateTooHigh)));
+    assert_eq!(t.vault.get_yield_rate(), 500);
+    assert_eq!(t.vault.get_yield_rate_version(), 1);
+}
+
+#[test]
+fn test_yield_rate_changed_event_payload() {
+    let t = VaultTest::setup();
+    let last = t.vault.get_last_accrued_at();
+    t.env.ledger().set_timestamp(last);
+    t.vault.set_yield_rate(&1_000u32);
+
+    let events = t.env.events().all();
+    let (contract_id, topics, data) = events.last().unwrap();
+    assert_eq!(contract_id, t.vault.address);
+    assert!(val_eq(
+        &t.env,
+        topics.get(0u32).unwrap(),
+        soroban_sdk::Symbol::new(&t.env, "rate").into_val(&t.env)
+    ));
+    assert!(val_eq(
+        &t.env,
+        data,
+        (1_000u32, 2u32, last).into_val(&t.env)
     ));
 }

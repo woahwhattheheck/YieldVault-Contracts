@@ -7,8 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Bounded simple-interest yield accrual with explicit rate (bps), ledger-timestamp
+  monotonicity, max accrual interval clamp, and rate-versioned `yield` / `rate`
+  events (`get_last_accrued_at`, `get_yield_rate`, `get_yield_rate_version`,
+  `set_yield_rate`). Closes #70.
+
 ### Changed
 
+- `accrue_yield` no longer takes a free-form amount; yield is derived from
+  `total_assets * rate_bps * elapsed / (BPS * SECONDS_PER_YEAR)`. On-chain
+  `version()` bumped to 3.
 - Aggregate totals (`total_shares`, `total_assets`, user balances) now use
   saturating arithmetic (`saturating_add`/`saturating_sub`) instead of
   checked arithmetic, per ADR 0026. Overflow caps at `u128::MAX` and

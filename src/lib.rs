@@ -48,6 +48,10 @@ impl YieldVault {
         // from the outset rather than relying solely on read-time fallbacks.
         storage::set_min_deposit(&env, types::DEFAULT_MIN_DEPOSIT);
         storage::set_paused(&env, false);
+        // Accrual clock starts at initialize: rate v1 at the ledger timestamp.
+        storage::set_yield_rate_bps(&env, types::MOCK_APY_BPS);
+        storage::set_yield_rate_version(&env, 1);
+        storage::set_last_accrued_at(&env, env.ledger().timestamp());
         storage::extend_instance(&env);
         events::initialize(&env, &admin, &token);
         Ok(())
@@ -303,34 +307,123 @@ impl YieldVault {
         Ok(assets)
     }
 
-    /// Mocks yield accrual by increasing the vault's total assets by `amount`
-    /// without minting new shares, raising the value of every existing share.
+    /// Accrues simple interest on the vault's total assets for the elapsed
+    /// interval since the last accrual boundary.
     ///
-    /// Admin-only: requires authorization from the configured admin address.
-    pub fn accrue_yield(env: Env, amount: u128) -> Result<(), Error> {
+    /// Semantics:
+    /// - Rate units: annual basis points (`10_000` == 100% APY).
+    /// - Interest: simple (non-compounding within one call):
+    ///   `assets * rate_bps * elapsed / (BPS_DENOMINATOR * SECONDS_PER_YEAR)`.
+    /// - Elapsed time is taken from the Soroban ledger timestamp and clamped to
+    ///   [`types::MAX_ACCRUAL_INTERVAL_SECS`] so long inactive periods stay
+    ///   bounded.
+    /// - A call at the same timestamp as the last accrual is a no-op (`Ok(0)`)
+    ///   and does not double-credit the interval.
+    /// - A ledger timestamp earlier than `last_accrued_at` returns
+    ///   [`Error::TimestampRegression`].
+    /// - Arithmetic overflow in the yield product returns [`Error::MathOverflow`]
+    ///   and leaves state unchanged; applying a computed yield uses saturating
+    ///   addition on `total_assets` (ADR 0026).
+    ///
+    /// Returns the amount of assets credited. Admin-only. Emits a `yield` event
+    /// carrying `(amount, total_assets, accrued_at, rate_version)` whenever a
+    /// positive amount is credited.
+    pub fn accrue_yield(env: Env) -> Result<u128, Error> {
+        storage::require_initialized(&env)?;
+        let admin = storage::get_admin(&env);
+        admin.require_auth();
+        Self::accrue_yield_internal(&env)
+    }
+
+    /// Sets the annual yield rate in basis points.
+    ///
+    /// Rate changes apply exactly at the current ledger timestamp: any elapsed
+    /// interval is first accrued at the *previous* rate, then the new rate and
+    /// an incremented rate version take effect. Rejects rates above
+    /// [`types::MAX_YIELD_RATE_BPS`].
+    ///
+    /// Admin-only. Emits a `rate` event with `(rate_bps, rate_version, effective_at)`.
+    pub fn set_yield_rate(env: Env, rate_bps: u32) -> Result<u128, Error> {
         storage::require_initialized(&env)?;
         let admin = storage::get_admin(&env);
         admin.require_auth();
 
-        if amount == 0 {
-            return Err(Error::ZeroAmount);
+        if rate_bps > types::MAX_YIELD_RATE_BPS {
+            return Err(Error::YieldRateTooHigh);
         }
 
-        let total_assets = storage::get_total_assets(&env).saturating_add(amount);
-        storage::set_total_assets(&env, total_assets);
-        storage::extend_instance(&env);
+        // Boundary: settle the open interval at the old rate before switching.
+        let accrued = Self::accrue_yield_internal(&env)?;
 
-        events::accrue_yield(&env, amount, total_assets);
-        Ok(())
+        let version = storage::get_yield_rate_version(&env).saturating_add(1);
+        let effective_at = env.ledger().timestamp();
+        storage::set_yield_rate_bps(&env, rate_bps);
+        storage::set_yield_rate_version(&env, version);
+        storage::extend_instance(&env);
+        events::yield_rate_changed(&env, rate_bps, version, effective_at);
+        Ok(accrued)
+    }
+
+    /// Returns the configured annual yield rate in basis points.
+    pub fn get_yield_rate(env: Env) -> u32 {
+        storage::get_yield_rate_bps(&env)
+    }
+
+    /// Returns the monotonic yield-rate configuration version.
+    pub fn get_yield_rate_version(env: Env) -> u32 {
+        storage::get_yield_rate_version(&env)
+    }
+
+    /// Returns the unix ledger timestamp of the last accrual boundary.
+    pub fn get_last_accrued_at(env: Env) -> u64 {
+        storage::get_last_accrued_at(&env)
     }
 
     /// Returns the vault's advertised annual percentage yield, expressed in
     /// basis points (1% == 100 basis points).
     ///
-    /// This is a fixed mock figure for demonstration purposes; a production
-    /// vault would derive it from observed yield over time.
-    pub fn get_apy(_env: Env) -> u32 {
-        types::MOCK_APY_BPS
+    /// Alias of [`Self::get_yield_rate`] for integrators that already call
+    /// `get_apy`.
+    pub fn get_apy(env: Env) -> u32 {
+        storage::get_yield_rate_bps(&env)
+    }
+
+    /// Shared accrual body used by [`Self::accrue_yield`] and
+    /// [`Self::set_yield_rate`]. See those entrypoints for the full contract.
+    fn accrue_yield_internal(env: &Env) -> Result<u128, Error> {
+        let now = env.ledger().timestamp();
+        let last = storage::get_last_accrued_at(env);
+        if now < last {
+            return Err(Error::TimestampRegression);
+        }
+
+        let elapsed_raw = now - last;
+        // Duplicate call in the same ledger second: no credit, no event.
+        if elapsed_raw == 0 {
+            return Ok(0);
+        }
+        let elapsed = elapsed_raw.min(types::MAX_ACCRUAL_INTERVAL_SECS);
+
+        let rate_bps = storage::get_yield_rate_bps(env);
+        let rate_version = storage::get_yield_rate_version(env);
+        let total_assets = storage::get_total_assets(env);
+        let amount = math::simple_yield(total_assets, rate_bps, elapsed)?;
+
+        // Always advance the accrual boundary, even when amount == 0 (empty
+        // vault or zero rate), so idle gaps do not later inflate a fresh
+        // deposit unfairly beyond the max-interval clamp.
+        storage::set_last_accrued_at(env, now);
+
+        if amount == 0 {
+            storage::extend_instance(env);
+            return Ok(0);
+        }
+
+        let new_total = total_assets.saturating_add(amount);
+        storage::set_total_assets(env, new_total);
+        storage::extend_instance(env);
+        events::accrue_yield(env, amount, new_total, now, rate_version);
+        Ok(amount)
     }
 
     /// Returns the contract's on-chain interface version.

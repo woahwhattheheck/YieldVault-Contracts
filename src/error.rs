@@ -31,4 +31,8 @@ pub enum Error {
     Paused = 9,
     /// The provided Wasm hash does not match the admin-approved expected hash.
     WasmHashMismatch = 10,
+    /// Ledger time moved backwards relative to the last accrual timestamp.
+    TimestampRegression = 11,
+    /// The proposed yield rate exceeds [`crate::types::MAX_YIELD_RATE_BPS`].
+    YieldRateTooHigh = 12,
 }

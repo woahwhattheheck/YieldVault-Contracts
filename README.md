@@ -12,7 +12,7 @@ of the underlying token.
 - Share/asset conversion math (ERC4626-style), rounding down in the vault's favor.
 - Empty-vault bootstrap: the first depositor mints shares one-to-one with assets.
 - Overflow-safe arithmetic using checked operations.
-- Admin-gated mock yield accrual to simulate returns.
+- Admin-gated bounded simple-interest yield accrual with explicit rate, timestamp, and max-interval semantics.
 - Events for initialize, deposit, withdraw, and yield accrual.
 - Authorization enforced via `require_auth` on the relevant caller.
 
@@ -26,7 +26,9 @@ of the underlying token.
 | `balance_of(user) -> shares` | A user's share balance. |
 | `total_shares()` | Total shares minted. |
 | `total_assets()` | Total underlying assets held. |
-| `accrue_yield(amount)` | Admin-only mock yield accrual. |
+| `accrue_yield() -> amount` | Admin-only simple-interest accrual over the elapsed (clamped) interval. |
+| `set_yield_rate(rate_bps)` | Admin-only rate update; settles the prior interval first. |
+| `get_yield_rate()` / `get_yield_rate_version()` / `get_last_accrued_at()` | Accrual configuration and clock getters. |
 | `convert_to_shares(assets)` | Preview shares for a given asset amount. |
 | `convert_to_assets(shares)` | Preview assets for a given share amount. |
 | `preview_deposit(assets)` | ERC4626-style alias of `convert_to_shares`. |
@@ -48,7 +50,8 @@ The configured admin address authorizes the following privileged entrypoints:
 
 | Function | Description |
 | --- | --- |
-| `accrue_yield(amount)` | Apply mock yield, raising the value of every share. |
+| `accrue_yield()` | Accrue simple interest at the configured rate since the last boundary. |
+| `set_yield_rate(rate_bps)` | Change the annual rate (bps); prior interval settles first. |
 | `set_paused(paused)` | Pause or resume new deposits; withdrawals stay open. |
 | `set_min_deposit(amount)` | Set the minimum accepted deposit amount. |
 | `set_admin(new_admin)` | Transfer the admin role to another address. |

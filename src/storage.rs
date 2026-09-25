@@ -168,3 +168,49 @@ pub fn clear_expected_wasm_hash(env: &Env) {
         .instance()
         .remove(&DataKey::ExpectedWasmHash);
 }
+
+/// Reads the annual yield rate in basis points, defaulting to
+/// [`crate::types::MOCK_APY_BPS`] when unset.
+pub fn get_yield_rate_bps(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::YieldRateBps)
+        .unwrap_or(crate::types::MOCK_APY_BPS)
+}
+
+/// Writes the annual yield rate in basis points.
+pub fn set_yield_rate_bps(env: &Env, rate_bps: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::YieldRateBps, &rate_bps);
+}
+
+/// Reads the yield-rate configuration version, defaulting to 0 when unset.
+pub fn get_yield_rate_version(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::YieldRateVersion)
+        .unwrap_or(0)
+}
+
+/// Writes the yield-rate configuration version.
+pub fn set_yield_rate_version(env: &Env, version: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::YieldRateVersion, &version);
+}
+
+/// Reads the last-accrued ledger timestamp, defaulting to 0 when unset.
+pub fn get_last_accrued_at(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::LastAccruedAt)
+        .unwrap_or(0)
+}
+
+/// Writes the last-accrued ledger timestamp.
+pub fn set_last_accrued_at(env: &Env, timestamp: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::LastAccruedAt, &timestamp);
+}
