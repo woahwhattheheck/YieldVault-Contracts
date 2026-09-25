@@ -56,3 +56,27 @@ pub fn upgrade(env: &Env, admin: &Address, new_wasm_hash: &BytesN<32>) {
     let topics = (Symbol::new(env, "upgrade"), admin.clone());
     env.events().publish(topics, new_wasm_hash.clone());
 }
+
+/// Publishes a `wd_limits` event recording the new per-operation and rolling-
+/// period withdrawal caps (units: underlying assets) and the period length
+/// in seconds.
+pub fn withdraw_limits(env: &Env, max_per_op: u128, max_per_period: u128, period_secs: u64) {
+    let topics = (Symbol::new(env, "wd_limits"),);
+    env.events()
+        .publish(topics, (max_per_op, max_per_period, period_secs));
+}
+
+/// Publishes a `wd_reset` event after an authorized rolling-period usage reset.
+/// `cleared` is the withdrawn amount that was zeroed; `at` is the new period
+/// start timestamp.
+pub fn withdraw_period_reset(env: &Env, cleared: u128, at: u64) {
+    let topics = (Symbol::new(env, "wd_reset"),);
+    env.events().publish(topics, (cleared, at));
+}
+
+/// Publishes a `wd_override` event recording whether the emergency withdrawal-
+/// limit override is enabled.
+pub fn withdraw_override(env: &Env, enabled: bool) {
+    let topics = (Symbol::new(env, "wd_override"),);
+    env.events().publish(topics, enabled);
+}

@@ -150,9 +150,7 @@ pub fn set_balance(env: &Env, user: &Address, balance: u128) {
 
 /// Returns the admin-approved expected Wasm hash, if one has been staged.
 pub fn get_expected_wasm_hash(env: &Env) -> Option<BytesN<32>> {
-    env.storage()
-        .instance()
-        .get(&DataKey::ExpectedWasmHash)
+    env.storage().instance().get(&DataKey::ExpectedWasmHash)
 }
 
 /// Stores the admin-approved Wasm hash that the next upgrade must present.
@@ -164,7 +162,93 @@ pub fn set_expected_wasm_hash(env: &Env, hash: &BytesN<32>) {
 
 /// Removes the staged expected Wasm hash after a successful upgrade.
 pub fn clear_expected_wasm_hash(env: &Env) {
+    env.storage().instance().remove(&DataKey::ExpectedWasmHash);
+}
+
+/// Reads the per-operation withdrawal asset cap (`0` = unlimited).
+pub fn get_max_withdraw_per_op(env: &Env) -> u128 {
     env.storage()
         .instance()
-        .remove(&DataKey::ExpectedWasmHash);
+        .get(&DataKey::MaxWithdrawPerOp)
+        .unwrap_or(0)
+}
+
+/// Writes the per-operation withdrawal asset cap (`0` = unlimited).
+pub fn set_max_withdraw_per_op(env: &Env, amount: u128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::MaxWithdrawPerOp, &amount);
+}
+
+/// Reads the rolling-period withdrawal asset cap (`0` = unlimited).
+pub fn get_max_withdraw_per_period(env: &Env) -> u128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxWithdrawPerPeriod)
+        .unwrap_or(0)
+}
+
+/// Writes the rolling-period withdrawal asset cap (`0` = unlimited).
+pub fn set_max_withdraw_per_period(env: &Env, amount: u128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::MaxWithdrawPerPeriod, &amount);
+}
+
+/// Reads the rolling withdrawal window length in seconds.
+pub fn get_withdraw_period_secs(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::WithdrawPeriodSecs)
+        .unwrap_or(crate::types::DEFAULT_WITHDRAW_PERIOD_SECS)
+}
+
+/// Writes the rolling withdrawal window length in seconds.
+pub fn set_withdraw_period_secs(env: &Env, secs: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::WithdrawPeriodSecs, &secs);
+}
+
+/// Reads assets withdrawn in the current rolling period.
+pub fn get_period_withdrawn(env: &Env) -> u128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::PeriodWithdrawn)
+        .unwrap_or(0)
+}
+
+/// Writes assets withdrawn in the current rolling period.
+pub fn set_period_withdrawn(env: &Env, amount: u128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PeriodWithdrawn, &amount);
+}
+
+/// Reads the ledger timestamp when the current rolling period started.
+pub fn get_period_started_at(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::PeriodStartedAt)
+        .unwrap_or(0)
+}
+
+/// Writes the ledger timestamp when the current rolling period started.
+pub fn set_period_started_at(env: &Env, at: u64) {
+    env.storage().instance().set(&DataKey::PeriodStartedAt, &at);
+}
+
+/// Returns `true` when the admin emergency override skips withdrawal limits.
+pub fn is_withdraw_limits_override(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::WithdrawLimitsOverride)
+        .unwrap_or(false)
+}
+
+/// Writes the withdrawal-limits emergency override flag.
+pub fn set_withdraw_limits_override(env: &Env, enabled: bool) {
+    env.storage()
+        .instance()
+        .set(&DataKey::WithdrawLimitsOverride, &enabled);
 }

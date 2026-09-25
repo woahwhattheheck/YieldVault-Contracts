@@ -2,9 +2,9 @@
 
 extern crate std;
 
-use soroban_sdk::testutils::{Address as _, Events as _};
+use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
 use soroban_sdk::token::{StellarAssetClient, TokenClient};
-use soroban_sdk::{Address, BytesN, Env, IntoVal};
+use soroban_sdk::{vec, Address, BytesN, Env, IntoVal, Symbol};
 
 fn val_eq(env: &soroban_sdk::Env, a: soroban_sdk::Val, b: soroban_sdk::Val) -> bool {
     let va: soroban_sdk::Vec<soroban_sdk::Val> = soroban_sdk::vec![env, a];
@@ -320,7 +320,7 @@ fn test_is_initialized_reflects_setup_state() {
 
     // Now reports initialized and exposes the contract version.
     assert!(vault.is_initialized());
-    assert_eq!(vault.version(), 2);
+    assert_eq!(vault.version(), 3);
 }
 
 #[test]
@@ -1011,4 +1011,238 @@ fn test_event_ordering_deposit_then_withdraw() {
         withdraw_data,
         (500u128, 500u128).into_val(&t.env)
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Bounded withdrawal / anti-drain policy (#77)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_withdraw_limits_default_unlimited() {
+    let t = VaultTest::setup();
+    assert_eq!(t.vault.get_max_withdraw_per_op(), 0);
+    assert_eq!(t.vault.get_max_withdraw_per_period(), 0);
+    assert_eq!(
+        t.vault.get_withdraw_period_secs(),
+        crate::types::DEFAULT_WITHDRAW_PERIOD_SECS
+    );
+    assert_eq!(t.vault.get_period_withdrawn(), 0);
+    assert!(!t.vault.is_withdraw_limits_override());
+}
+
+#[test]
+fn test_per_op_withdraw_limit_boundary() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    t.mint(&user, 1_000);
+    t.vault.deposit(&user, &1_000u128);
+
+    // Cap a single redeem at 400 underlying assets.
+    t.vault.set_withdraw_limits(&400u128, &0u128, &86_400u64);
+    assert_eq!(t.vault.get_max_withdraw_per_op(), 400);
+
+    // Exactly at the boundary succeeds.
+    let ok = t.vault.withdraw(&user, &400u128);
+    assert_eq!(ok, 400);
+    assert_eq!(t.vault.get_period_withdrawn(), 0); // period unlimited
+
+    // One asset over the per-op cap fails atomically (balances unchanged).
+    let before = t.vault.balance_of(&user);
+    let res = t.vault.try_withdraw(&user, &401u128);
+    assert_eq!(res, Err(Ok(crate::Error::WithdrawLimitExceeded)));
+    assert_eq!(t.vault.balance_of(&user), before);
+    assert_eq!(t.token.balance(&user), 400);
+}
+
+#[test]
+fn test_period_limit_blocks_aggregate_and_resets_on_window() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    t.mint(&user, 1_000);
+    t.vault.deposit(&user, &1_000u128);
+
+    // 500 assets per rolling 100-second window; no per-op cap.
+    t.env.ledger().set_timestamp(1_000);
+    t.vault.set_withdraw_limits(&0u128, &500u128, &100u64);
+    t.vault.reset_withdraw_period(); // start window at t=1000
+
+    assert_eq!(t.vault.withdraw(&user, &300u128), 300);
+    assert_eq!(t.vault.get_period_withdrawn(), 300);
+
+    // 300 + 250 = 550 > 500 → reject; state unchanged for this call.
+    let before_shares = t.vault.balance_of(&user);
+    let res = t.vault.try_withdraw(&user, &250u128);
+    assert_eq!(res, Err(Ok(crate::Error::WithdrawPeriodLimitExceeded)));
+    assert_eq!(t.vault.balance_of(&user), before_shares);
+    assert_eq!(t.vault.get_period_withdrawn(), 300);
+
+    // Remaining capacity (200) succeeds.
+    assert_eq!(t.vault.withdraw(&user, &200u128), 200);
+    assert_eq!(t.vault.get_period_withdrawn(), 500);
+
+    // Advance past the window — usage rolls and a fresh 300 is allowed.
+    t.env.ledger().set_timestamp(1_000 + 100);
+    assert_eq!(t.vault.withdraw(&user, &300u128), 300);
+    assert_eq!(t.vault.get_period_withdrawn(), 300);
+}
+
+#[test]
+fn test_batch_cannot_bypass_period_limit() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    t.mint(&user, 1_000);
+    t.vault.deposit(&user, &1_000u128);
+
+    t.vault.set_withdraw_limits(&400u128, &500u128, &86_400u64);
+    t.vault.reset_withdraw_period();
+
+    // Each leg ≤ per-op (400) but sum 300+300=600 > period 500.
+    let shares = vec![&t.env, 300u128, 300u128];
+    let before = t.vault.balance_of(&user);
+    let res = t.vault.try_withdraw_batch(&user, &shares);
+    assert_eq!(res, Err(Ok(crate::Error::WithdrawPeriodLimitExceeded)));
+    assert_eq!(t.vault.balance_of(&user), before);
+    assert_eq!(t.vault.get_period_withdrawn(), 0);
+    assert_eq!(t.token.balance(&user), 0);
+
+    // Sum within period succeeds and records aggregate usage once.
+    let ok_shares = vec![&t.env, 200u128, 200u128];
+    let assets = t.vault.withdraw_batch(&user, &ok_shares);
+    assert_eq!(assets, 400);
+    assert_eq!(t.vault.get_period_withdrawn(), 400);
+    assert_eq!(t.vault.balance_of(&user), 600);
+}
+
+#[test]
+fn test_batch_per_op_leg_and_empty_batch() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    t.mint(&user, 1_000);
+    t.vault.deposit(&user, &1_000u128);
+
+    t.vault.set_withdraw_limits(&250u128, &0u128, &86_400u64);
+
+    // Second leg exceeds per-op → whole batch fails.
+    let shares = vec![&t.env, 100u128, 300u128];
+    let before = t.vault.balance_of(&user);
+    let res = t.vault.try_withdraw_batch(&user, &shares);
+    assert_eq!(res, Err(Ok(crate::Error::WithdrawLimitExceeded)));
+    assert_eq!(t.vault.balance_of(&user), before);
+
+    let empty: soroban_sdk::Vec<u128> = soroban_sdk::Vec::new(&t.env);
+    let res = t.vault.try_withdraw_batch(&user, &empty);
+    assert_eq!(res, Err(Ok(crate::Error::EmptyBatch)));
+}
+
+#[test]
+fn test_concurrent_withdrawals_share_period_budget() {
+    let t = VaultTest::setup();
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
+    t.mint(&alice, 1_000);
+    t.mint(&bob, 1_000);
+    t.vault.deposit(&alice, &1_000u128);
+    t.vault.deposit(&bob, &1_000u128);
+
+    t.vault.set_withdraw_limits(&0u128, &700u128, &86_400u64);
+    t.vault.reset_withdraw_period();
+
+    assert_eq!(t.vault.withdraw(&alice, &400u128), 400);
+    assert_eq!(t.vault.get_period_withdrawn(), 400);
+
+    // Bob's 400 would push aggregate to 800 > 700.
+    let res = t.vault.try_withdraw(&bob, &400u128);
+    assert_eq!(res, Err(Ok(crate::Error::WithdrawPeriodLimitExceeded)));
+    assert_eq!(t.vault.balance_of(&bob), 1_000);
+
+    // Bob can take the remaining 300.
+    assert_eq!(t.vault.withdraw(&bob, &300u128), 300);
+    assert_eq!(t.vault.get_period_withdrawn(), 700);
+}
+
+#[test]
+fn test_admin_reset_and_override_are_authorized_and_emitted() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    t.mint(&user, 1_000);
+    t.vault.deposit(&user, &1_000u128);
+
+    t.vault.set_withdraw_limits(&0u128, &200u128, &86_400u64);
+    let (_, limits_topics, limits_data) = t.env.events().all().last().unwrap();
+    assert!(val_eq(
+        &t.env,
+        limits_topics.get(0u32).unwrap(),
+        Symbol::new(&t.env, "wd_limits").into_val(&t.env)
+    ));
+    assert!(val_eq(
+        &t.env,
+        limits_data,
+        (0u128, 200u128, 86_400u64).into_val(&t.env)
+    ));
+
+    t.vault.reset_withdraw_period();
+    let (_, reset_topics, reset_data) = t.env.events().all().last().unwrap();
+    assert!(val_eq(
+        &t.env,
+        reset_topics.get(0u32).unwrap(),
+        Symbol::new(&t.env, "wd_reset").into_val(&t.env)
+    ));
+    let cleared_at_start = 0u128;
+    let at = t.vault.get_period_started_at();
+    assert!(val_eq(
+        &t.env,
+        reset_data,
+        (cleared_at_start, at).into_val(&t.env)
+    ));
+
+    assert_eq!(t.vault.withdraw(&user, &200u128), 200);
+    assert_eq!(t.vault.get_period_withdrawn(), 200);
+
+    // Further withdraw blocked until reset.
+    let res = t.vault.try_withdraw(&user, &1u128);
+    assert_eq!(res, Err(Ok(crate::Error::WithdrawPeriodLimitExceeded)));
+
+    t.vault.reset_withdraw_period();
+    let (_, reset2_topics, reset2_data) = t.env.events().all().last().unwrap();
+    assert!(val_eq(
+        &t.env,
+        reset2_topics.get(0u32).unwrap(),
+        Symbol::new(&t.env, "wd_reset").into_val(&t.env)
+    ));
+    let started = t.vault.get_period_started_at();
+    assert_eq!(t.vault.get_period_withdrawn(), 0);
+    assert!(val_eq(
+        &t.env,
+        reset2_data,
+        (200u128, started).into_val(&t.env)
+    ));
+
+    // Override lets a drain past the period cap; usage is not recorded.
+    t.vault.set_withdraw_limits_override(&true);
+    let (_, ov_topics, ov_data) = t.env.events().all().last().unwrap();
+    assert!(val_eq(
+        &t.env,
+        ov_topics.get(0u32).unwrap(),
+        Symbol::new(&t.env, "wd_override").into_val(&t.env)
+    ));
+    assert!(val_eq(&t.env, ov_data, true.into_val(&t.env)));
+    assert!(t.vault.is_withdraw_limits_override());
+    assert_eq!(t.vault.withdraw(&user, &500u128), 500);
+    assert_eq!(t.vault.get_period_withdrawn(), 0);
+
+    // Disable override — limits enforce again.
+    t.vault.set_withdraw_limits_override(&false);
+    t.vault.set_withdraw_limits(&0u128, &100u128, &86_400u64);
+    t.vault.reset_withdraw_period();
+    assert_eq!(t.vault.withdraw(&user, &100u128), 100);
+    let res = t.vault.try_withdraw(&user, &1u128);
+    assert_eq!(res, Err(Ok(crate::Error::WithdrawPeriodLimitExceeded)));
+}
+
+#[test]
+fn test_invalid_period_config_and_version() {
+    let t = VaultTest::setup();
+    let res = t.vault.try_set_withdraw_limits(&0u128, &100u128, &0u64);
+    assert_eq!(res, Err(Ok(crate::Error::InvalidWithdrawLimit)));
+    assert_eq!(t.vault.version(), 3);
 }

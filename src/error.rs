@@ -31,4 +31,14 @@ pub enum Error {
     Paused = 9,
     /// The provided Wasm hash does not match the admin-approved expected hash.
     WasmHashMismatch = 10,
+    /// A single withdraw (or batch leg) exceeds the configured per-operation
+    /// asset limit.
+    WithdrawLimitExceeded = 11,
+    /// The rolling-period aggregate withdrawal limit would be exceeded.
+    WithdrawPeriodLimitExceeded = 12,
+    /// A batch withdraw was invoked with an empty share list.
+    EmptyBatch = 13,
+    /// Withdrawal-limit configuration is invalid (e.g. a positive period cap
+    /// with a zero-length period).
+    InvalidWithdrawLimit = 14,
 }

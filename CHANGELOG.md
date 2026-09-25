@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Bounded withdrawal / anti-drain controls: per-operation and rolling-period
+  asset caps (`set_withdraw_limits`), auditable period reset
+  (`reset_withdraw_period`), emergency override (`set_withdraw_limits_override`),
+  and `withdraw_batch` that cannot bypass the period aggregate. Defaults remain
+  unlimited (`0`) until configured. On-chain `version()` bumped to 3.
+
 ### Changed
 
 - Aggregate totals (`total_shares`, `total_assets`, user balances) now use

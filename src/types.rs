@@ -10,7 +10,7 @@ use soroban_sdk::{contracttype, Address};
 pub const MOCK_APY_BPS: u32 = 500;
 
 /// The on-chain contract version, bumped on each released interface change.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Fixed-point scale used when reporting the price of a single share, so that
 /// fractional share prices survive integer division (1e9 == one whole asset).
@@ -23,6 +23,11 @@ pub const BPS_DENOMINATOR: u128 = 10_000;
 /// Default minimum deposit applied when the vault is initialized, guarding
 /// against dust deposits that would round down to zero shares.
 pub const DEFAULT_MIN_DEPOSIT: u128 = 1;
+
+/// Default rolling withdrawal-period length (1 day in seconds). Used when the
+/// admin has not configured a custom period. A value of `0` for either limit
+/// means "unlimited" so existing deployments stay permissive until configured.
+pub const DEFAULT_WITHDRAW_PERIOD_SECS: u64 = 24 * 60 * 60;
 
 /// Keys used to address values in contract storage.
 #[contracttype]
@@ -45,4 +50,19 @@ pub enum DataKey {
     /// The admin-approved Wasm hash that the next upgrade must present
     /// (instance storage). Cleared automatically on a successful upgrade.
     ExpectedWasmHash,
+    /// Max underlying assets redeemable in a single withdraw operation
+    /// (instance storage). `0` means unlimited.
+    MaxWithdrawPerOp,
+    /// Max underlying assets redeemable across the rolling period
+    /// (instance storage). `0` means unlimited.
+    MaxWithdrawPerPeriod,
+    /// Rolling withdrawal window length in seconds (instance storage).
+    WithdrawPeriodSecs,
+    /// Assets withdrawn so far in the current rolling period (instance storage).
+    PeriodWithdrawn,
+    /// Ledger timestamp when the current rolling period started (instance storage).
+    PeriodStartedAt,
+    /// When `true`, per-op and period withdrawal limits are skipped
+    /// (instance storage). Admin-only emergency override.
+    WithdrawLimitsOverride,
 }
