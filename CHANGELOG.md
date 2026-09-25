@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Deterministic fuzz / property suite for share↔asset conversion, BPS
+  (fee/rate) bounds, overflow rejection, and deposit/withdraw conservation
+  (`src/fuzz.rs`, issue #74). Fixed seed `FUZZ_SEED`; failures report seed
+  and minimized inputs for CI-reproducible counterexamples.
+
 ### Changed
 
 - Aggregate totals (`total_shares`, `total_assets`, user balances) now use

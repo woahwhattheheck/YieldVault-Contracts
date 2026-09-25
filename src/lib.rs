@@ -18,6 +18,9 @@ mod types;
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod fuzz;
+
 pub use error::Error;
 
 use soroban_sdk::{contract, contractimpl, contractmeta, token, Address, BytesN, Env};
