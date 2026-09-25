@@ -31,6 +31,64 @@ contractmeta!(
 #[contract]
 pub struct YieldVault;
 
+/// Convert a vault `u128` amount into the `i128` expected by SEP-41 token clients.
+fn amount_to_i128(amount: u128) -> Result<i128, Error> {
+    i128::try_from(amount).map_err(|_| Error::AmountOverflow)
+}
+
+/// Ensure a single user's share balance never exceeds the vault-wide total.
+fn ensure_share_invariant(env: &Env, user: &Address) -> Result<(), Error> {
+    if storage::get_balance(env, user) > storage::get_total_shares(env) {
+        return Err(Error::InvariantViolation);
+    }
+    Ok(())
+}
+
+/// Pull `amount` of `token` from `from` into the vault and require an exact
+/// balance increase. Transfer failures and short/malformed deliveries become
+/// errors so the host rolls back every related vault mutation.
+fn pull_token_exact(env: &Env, token: &Address, from: &Address, amount: u128) -> Result<(), Error> {
+    let amount_i = amount_to_i128(amount)?;
+    let client = token::Client::new(env, token);
+    let vault = env.current_contract_address();
+    let before = client.balance(&vault);
+    match client.try_transfer(from, &vault, &amount_i) {
+        Ok(Ok(())) => {}
+        _ => return Err(Error::TokenTransferFailed),
+    }
+    let after = client.balance(&vault);
+    let received = after
+        .checked_sub(before)
+        .ok_or(Error::TransferAmountMismatch)?;
+    if received != amount_i {
+        return Err(Error::TransferAmountMismatch);
+    }
+    Ok(())
+}
+
+/// Push `amount` of `token` from the vault to `to` and require an exact
+/// balance decrease. Transfer failures and short/malformed deliveries become
+/// errors so the host rolls back every related vault mutation (including prior
+/// share burns).
+fn push_token_exact(env: &Env, token: &Address, to: &Address, amount: u128) -> Result<(), Error> {
+    let amount_i = amount_to_i128(amount)?;
+    let client = token::Client::new(env, token);
+    let vault = env.current_contract_address();
+    let before = client.balance(&vault);
+    match client.try_transfer(&vault, to, &amount_i) {
+        Ok(Ok(())) => {}
+        _ => return Err(Error::TokenTransferFailed),
+    }
+    let after = client.balance(&vault);
+    let sent = before
+        .checked_sub(after)
+        .ok_or(Error::TransferAmountMismatch)?;
+    if sent != amount_i {
+        return Err(Error::TransferAmountMismatch);
+    }
+    Ok(())
+}
+
 #[contractimpl]
 impl YieldVault {
     /// Initializes the vault with its `admin` and the `token` it accepts as the
@@ -221,8 +279,11 @@ impl YieldVault {
     /// Deposits `amount` of the underlying token from `from` into the vault,
     /// minting and returning the number of shares credited to `from`.
     ///
-    /// Requires authorization from `from`. The underlying tokens are pulled
-    /// from `from` into the vault via the token contract's `transfer`.
+    /// Requires authorization from `from`. Token movement and vault accounting
+    /// are atomic: the pull must credit the vault by exactly `amount`, then
+    /// shares/assets/balances are updated once. Transfer failures, short or
+    /// malformed token deliveries, and invariant violations return an error so
+    /// the host rolls back every related mutation.
     pub fn deposit(env: Env, from: Address, amount: u128) -> Result<u128, Error> {
         storage::require_initialized(&env)?;
         from.require_auth();
@@ -237,6 +298,10 @@ impl YieldVault {
             return Err(Error::BelowMinimumDeposit);
         }
 
+        // Reject amounts the SEP-41 token interface cannot represent before any
+        // state change or external call.
+        let _ = amount_to_i128(amount)?;
+
         let total_shares = storage::get_total_shares(&env);
         let total_assets = storage::get_total_assets(&env);
         let shares = math::convert_to_shares(amount, total_shares, total_assets)?;
@@ -244,10 +309,11 @@ impl YieldVault {
             return Err(Error::ZeroShares);
         }
 
+        // Interaction: pull tokens and require an exact balance increase.
         let token_address = storage::get_token(&env);
-        let client = token::Client::new(&env, &token_address);
-        client.transfer(&from, &env.current_contract_address(), &(amount as i128));
+        pull_token_exact(&env, &token_address, &from, amount)?;
 
+        // Effects: mint shares and credit assets exactly once.
         let new_total_shares = total_shares.saturating_add(shares);
         let new_total_assets = total_assets.saturating_add(amount);
         let user_balance = storage::get_balance(&env, &from).saturating_add(shares);
@@ -255,6 +321,7 @@ impl YieldVault {
         storage::set_total_shares(&env, new_total_shares);
         storage::set_total_assets(&env, new_total_assets);
         storage::set_balance(&env, &from, user_balance);
+        ensure_share_invariant(&env, &from)?;
         storage::extend_instance(&env);
 
         events::deposit(&env, &from, amount, shares);
@@ -264,8 +331,15 @@ impl YieldVault {
     /// Burns `shares` from `from` and returns the corresponding amount of
     /// underlying assets, transferring them back to `from`.
     ///
-    /// Requires authorization from `from`. Returns [`Error::InsufficientShares`]
-    /// if `from` does not hold enough shares.
+    /// Requires authorization from `from`. Token movement and vault accounting
+    /// are atomic (checks-effects-interactions): shares and aggregates are
+    /// updated first, then the outbound transfer must debit the vault by
+    /// exactly the redeemed asset amount. Transfer failures or malformed
+    /// deliveries return an error so the host rolls back the share burn and
+    /// every related mutation.
+    ///
+    /// Returns [`Error::InsufficientShares`] if `from` does not hold enough
+    /// shares.
     pub fn withdraw(env: Env, from: Address, shares: u128) -> Result<u128, Error> {
         storage::require_initialized(&env)?;
         from.require_auth();
@@ -286,6 +360,12 @@ impl YieldVault {
             return Err(Error::ZeroAmount);
         }
 
+        // Reject amounts the SEP-41 token interface cannot represent before any
+        // state change or external call.
+        let _ = amount_to_i128(assets)?;
+
+        // Effects before interaction so a re-entering token cannot observe
+        // stale balances. A failed/malformed push rolls these effects back.
         let new_total_shares = total_shares.saturating_sub(shares);
         let new_total_assets = total_assets.saturating_sub(assets);
         let new_user_balance = user_balance.saturating_sub(shares);
@@ -293,10 +373,10 @@ impl YieldVault {
         storage::set_total_shares(&env, new_total_shares);
         storage::set_total_assets(&env, new_total_assets);
         storage::set_balance(&env, &from, new_user_balance);
+        ensure_share_invariant(&env, &from)?;
 
         let token_address = storage::get_token(&env);
-        let client = token::Client::new(&env, &token_address);
-        client.transfer(&env.current_contract_address(), &from, &(assets as i128));
+        push_token_exact(&env, &token_address, &from, assets)?;
 
         storage::extend_instance(&env);
         events::withdraw(&env, &from, shares, assets);

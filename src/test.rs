@@ -320,7 +320,7 @@ fn test_is_initialized_reflects_setup_state() {
 
     // Now reports initialized and exposes the contract version.
     assert!(vault.is_initialized());
-    assert_eq!(vault.version(), 2);
+    assert_eq!(vault.version(), 3);
 }
 
 #[test]
@@ -1011,4 +1011,173 @@ fn test_event_ordering_deposit_then_withdraw() {
         withdraw_data,
         (500u128, 500u128).into_val(&t.env)
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Atomic deposit / withdraw failure handling (#76)
+// ---------------------------------------------------------------------------
+
+/// Fee-on-transfer mock: debits `amount` from `from` but credits only 99% to
+/// `to`, modelling short/malformed SEP-41 delivery the vault must reject.
+mod fee_on_transfer_token {
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum DataKey {
+        Balance(Address),
+    }
+
+    #[contract]
+    pub struct FeeOnTransferToken;
+
+    #[contractimpl]
+    impl FeeOnTransferToken {
+        pub fn mint(env: Env, to: Address, amount: i128) {
+            let key = DataKey::Balance(to.clone());
+            let bal: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            env.storage().persistent().set(&key, &(bal + amount));
+        }
+
+        pub fn balance(env: Env, id: Address) -> i128 {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Balance(id))
+                .unwrap_or(0)
+        }
+
+        pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            from.require_auth();
+            let from_key = DataKey::Balance(from.clone());
+            let from_bal: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&from_key, &(from_bal - amount));
+
+            let credited = amount - (amount / 100);
+            let to_key = DataKey::Balance(to.clone());
+            let to_bal: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&to_key, &(to_bal + credited));
+        }
+    }
+}
+
+#[test]
+fn test_deposit_fails_atomically_without_token_balance() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    // User holds no tokens — transfer must fail and leave vault state untouched.
+    let res = t.vault.try_deposit(&user, &1_000u128);
+    assert_eq!(res, Err(Ok(crate::Error::TokenTransferFailed)));
+    assert_eq!(t.vault.total_shares(), 0);
+    assert_eq!(t.vault.total_assets(), 0);
+    assert_eq!(t.vault.balance_of(&user), 0);
+}
+
+#[test]
+fn test_deposit_rejects_amount_overflow() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    // Amount above i128::MAX cannot be passed to SEP-41 transfer.
+    let too_large = (i128::MAX as u128) + 1;
+    let res = t.vault.try_deposit(&user, &too_large);
+    assert_eq!(res, Err(Ok(crate::Error::AmountOverflow)));
+    assert_eq!(t.vault.total_shares(), 0);
+    assert_eq!(t.vault.total_assets(), 0);
+}
+
+#[test]
+fn test_deposit_rejects_fee_on_transfer_short_delivery() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let fee_token_id = env.register(fee_on_transfer_token::FeeOnTransferToken, ());
+    let fee_token = fee_on_transfer_token::FeeOnTransferTokenClient::new(&env, &fee_token_id);
+
+    let vault_id = env.register(YieldVault, ());
+    let vault = YieldVaultClient::new(&env, &vault_id);
+    vault.initialize(&admin, &fee_token_id);
+
+    let user = Address::generate(&env);
+    fee_token.mint(&user, &1_000);
+
+    let res = vault.try_deposit(&user, &1_000u128);
+    assert_eq!(res, Err(Ok(crate::Error::TransferAmountMismatch)));
+
+    // Atomic: no shares minted / no assets credited despite a partial credit
+    // that the host will roll back with the error return.
+    assert_eq!(vault.total_shares(), 0);
+    assert_eq!(vault.total_assets(), 0);
+    assert_eq!(vault.balance_of(&user), 0);
+}
+
+#[test]
+fn test_withdraw_fails_atomically_when_vault_lacks_tokens() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    t.mint(&user, 1_000);
+    let shares = t.vault.deposit(&user, &1_000u128);
+
+    // Accrue accounting yield without funding the vault with real tokens, so
+    // the outbound transfer cannot deliver the redeemed assets.
+    t.vault.accrue_yield(&500u128);
+    assert_eq!(t.vault.total_assets(), 1_500);
+    assert_eq!(t.token.balance(&t.vault.address), 1_000);
+
+    let shares_before = t.vault.balance_of(&user);
+    let total_shares_before = t.vault.total_shares();
+    let total_assets_before = t.vault.total_assets();
+    let user_tokens_before = t.token.balance(&user);
+
+    let res = t.vault.try_withdraw(&user, &shares);
+    assert_eq!(res, Err(Ok(crate::Error::TokenTransferFailed)));
+
+    // Share burn and aggregate updates must roll back with the failed transfer.
+    assert_eq!(t.vault.balance_of(&user), shares_before);
+    assert_eq!(t.vault.total_shares(), total_shares_before);
+    assert_eq!(t.vault.total_assets(), total_assets_before);
+    assert_eq!(t.token.balance(&user), user_tokens_before);
+    assert_eq!(t.token.balance(&t.vault.address), 1_000);
+}
+
+#[test]
+fn test_successful_deposit_updates_state_exactly_once() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    t.mint(&user, 2_000);
+
+    let shares = t.vault.deposit(&user, &1_000u128);
+    assert_eq!(shares, 1_000);
+    assert_eq!(t.vault.balance_of(&user), 1_000);
+    assert_eq!(t.vault.total_shares(), 1_000);
+    assert_eq!(t.vault.total_assets(), 1_000);
+    assert_eq!(t.token.balance(&t.vault.address), 1_000);
+    assert_eq!(t.token.balance(&user), 1_000);
+
+    // Second deposit still updates each balance exactly once per call.
+    let shares2 = t.vault.deposit(&user, &1_000u128);
+    assert_eq!(shares2, 1_000);
+    assert_eq!(t.vault.balance_of(&user), 2_000);
+    assert_eq!(t.vault.total_shares(), 2_000);
+    assert_eq!(t.vault.total_assets(), 2_000);
+    assert_eq!(t.token.balance(&t.vault.address), 2_000);
+    assert_eq!(t.token.balance(&user), 0);
+}
+
+#[test]
+fn test_share_invariant_holds_after_deposit_and_withdraw() {
+    let t = VaultTest::setup();
+    let user = Address::generate(&t.env);
+    t.mint(&user, 1_000);
+
+    let shares = t.vault.deposit(&user, &1_000u128);
+    assert!(t.vault.balance_of(&user) <= t.vault.total_shares());
+
+    let _ = t.vault.withdraw(&user, &(shares / 2));
+    assert!(t.vault.balance_of(&user) <= t.vault.total_shares());
+    assert_eq!(t.vault.total_shares(), shares / 2);
+    assert_eq!(t.vault.total_assets(), 500);
 }

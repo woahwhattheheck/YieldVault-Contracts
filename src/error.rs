@@ -31,4 +31,13 @@ pub enum Error {
     Paused = 9,
     /// The provided Wasm hash does not match the admin-approved expected hash.
     WasmHashMismatch = 10,
+    /// A token amount exceeded the `i128` range required by SEP-41 transfers.
+    AmountOverflow = 11,
+    /// The underlying token transfer failed (e.g. insufficient balance).
+    TokenTransferFailed = 12,
+    /// The token's balance delta did not match the requested amount exactly
+    /// (short delivery, fee-on-transfer, or other malformed asset behavior).
+    TransferAmountMismatch = 13,
+    /// An internal vault invariant was violated (shares / assets / balances).
+    InvariantViolation = 14,
 }

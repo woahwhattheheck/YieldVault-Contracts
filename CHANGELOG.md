@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `deposit` and `withdraw` now treat token movement and vault accounting as a
+  single atomic unit: amounts that do not fit SEP-41 `i128` are rejected,
+  transfers go through `TokenClient::try_transfer`, and the vault's token
+  balance delta must match the requested amount exactly. Transfer failures or
+  short/malformed deliveries return an error so the host rolls back every
+  related mutation. Share/balance invariants are checked after successful
+  state updates. On-chain `version()` bumped to **3**.
+
+### Added
+
+- Error codes `AmountOverflow` (11), `TokenTransferFailed` (12),
+  `TransferAmountMismatch` (13), and `InvariantViolation` (14).
+
+### Changed
+
 - Aggregate totals (`total_shares`, `total_assets`, user balances) now use
   saturating arithmetic (`saturating_add`/`saturating_sub`) instead of
   checked arithmetic, per ADR 0026. Overflow caps at `u128::MAX` and
