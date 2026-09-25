@@ -114,12 +114,13 @@ impl YieldVault {
     /// Previews how many shares a [`Self::deposit`] of `assets` would mint at
     /// the current exchange rate, without modifying any state.
     ///
-    /// This is the ERC4626-style alias for [`Self::convert_to_shares`], provided
-    /// so integrators can use the conventional preview naming.
+    /// Applies the same invariant checks as [`Self::deposit`] (paused, zero
+    /// amount, minimum deposit, dust shares) so callers can predict success or
+    /// the exact error a mutation would return for identical state and input.
+    /// Pure conversion without those checks remains available via
+    /// [`Self::convert_to_shares`].
     pub fn preview_deposit(env: Env, assets: u128) -> Result<u128, Error> {
-        let total_shares = storage::get_total_shares(&env);
-        let total_assets = storage::get_total_assets(&env);
-        math::convert_to_shares(assets, total_shares, total_assets)
+        preview_deposit_shares(&env, assets)
     }
 
     /// Returns the value of a single share in underlying assets, scaled by
@@ -143,12 +144,13 @@ impl YieldVault {
     /// Previews how many underlying assets a [`Self::withdraw`] of `shares`
     /// would return at the current exchange rate, without modifying any state.
     ///
-    /// This is the ERC4626-style alias for [`Self::convert_to_assets`], provided
-    /// so integrators can use the conventional preview naming.
+    /// Applies the same invariant checks as [`Self::withdraw`] for the
+    /// conversion path (zero shares, dust assets). Does not check per-user
+    /// balance; callers that need that should also read [`Self::balance_of`].
+    /// Pure conversion without those checks remains available via
+    /// [`Self::convert_to_assets`].
     pub fn preview_withdraw(env: Env, shares: u128) -> Result<u128, Error> {
-        let total_shares = storage::get_total_shares(&env);
-        let total_assets = storage::get_total_assets(&env);
-        math::convert_to_assets(shares, total_shares, total_assets)
+        preview_withdraw_assets(&env, shares)
     }
 
     /// Returns the amount of underlying assets `user` could withdraw by
@@ -227,22 +229,11 @@ impl YieldVault {
         storage::require_initialized(&env)?;
         from.require_auth();
 
-        if storage::is_paused(&env) {
-            return Err(Error::Paused);
-        }
-        if amount == 0 {
-            return Err(Error::ZeroAmount);
-        }
-        if amount < storage::get_min_deposit(&env) {
-            return Err(Error::BelowMinimumDeposit);
-        }
+        // Shared with preview_deposit so mutation outcomes stay identical.
+        let shares = preview_deposit_shares(&env, amount)?;
 
         let total_shares = storage::get_total_shares(&env);
         let total_assets = storage::get_total_assets(&env);
-        let shares = math::convert_to_shares(amount, total_shares, total_assets)?;
-        if shares == 0 {
-            return Err(Error::ZeroShares);
-        }
 
         let token_address = storage::get_token(&env);
         let client = token::Client::new(&env, &token_address);
@@ -270,21 +261,17 @@ impl YieldVault {
         storage::require_initialized(&env)?;
         from.require_auth();
 
-        if shares == 0 {
-            return Err(Error::ZeroShares);
-        }
-
         let user_balance = storage::get_balance(&env, &from);
         if user_balance < shares {
             return Err(Error::InsufficientShares);
         }
 
+        // Shared with preview_withdraw so mutation outcomes stay identical
+        // for the conversion invariants (zero/dust). Balance checks stay here.
+        let assets = preview_withdraw_assets(&env, shares)?;
+
         let total_shares = storage::get_total_shares(&env);
         let total_assets = storage::get_total_assets(&env);
-        let assets = math::convert_to_assets(shares, total_shares, total_assets)?;
-        if assets == 0 {
-            return Err(Error::ZeroAmount);
-        }
 
         let new_total_shares = total_shares.saturating_sub(shares);
         let new_total_assets = total_assets.saturating_sub(assets);
@@ -388,4 +375,47 @@ impl YieldVault {
         events::upgrade(&env, &admin, &new_wasm_hash);
         Ok(())
     }
+}
+
+/// Computes the shares a deposit of `assets` would mint, applying the same
+/// invariant checks as [`YieldVault::deposit`] (initialized, paused, zero,
+/// minimum, dust). Used by both the preview entrypoint and the mutation so
+/// results cannot drift.
+fn preview_deposit_shares(env: &Env, assets: u128) -> Result<u128, Error> {
+    storage::require_initialized(env)?;
+    if storage::is_paused(env) {
+        return Err(Error::Paused);
+    }
+    if assets == 0 {
+        return Err(Error::ZeroAmount);
+    }
+    if assets < storage::get_min_deposit(env) {
+        return Err(Error::BelowMinimumDeposit);
+    }
+
+    let total_shares = storage::get_total_shares(env);
+    let total_assets = storage::get_total_assets(env);
+    let shares = math::convert_to_shares(assets, total_shares, total_assets)?;
+    if shares == 0 {
+        return Err(Error::ZeroShares);
+    }
+    Ok(shares)
+}
+
+/// Computes the assets a withdrawal of `shares` would return, applying the
+/// same conversion invariants as [`YieldVault::withdraw`] (initialized, zero
+/// shares, dust assets). Per-user balance checks remain in the mutation.
+fn preview_withdraw_assets(env: &Env, shares: u128) -> Result<u128, Error> {
+    storage::require_initialized(env)?;
+    if shares == 0 {
+        return Err(Error::ZeroShares);
+    }
+
+    let total_shares = storage::get_total_shares(env);
+    let total_assets = storage::get_total_assets(env);
+    let assets = math::convert_to_assets(shares, total_shares, total_assets)?;
+    if assets == 0 {
+        return Err(Error::ZeroAmount);
+    }
+    Ok(assets)
 }

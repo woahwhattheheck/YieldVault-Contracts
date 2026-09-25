@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `preview_deposit` and `preview_withdraw` are now invariant-checked: they apply
+  the same paused / zero / minimum-deposit / dust validations as the matching
+  mutations so callers can predict success or the exact error for identical
+  state and input. Pure unchecked conversion remains on `convert_to_shares` /
+  `convert_to_assets`. On-chain `version()` bumped to **3**.
 - Aggregate totals (`total_shares`, `total_assets`, user balances) now use
   saturating arithmetic (`saturating_add`/`saturating_sub`) instead of
   checked arithmetic, per ADR 0026. Overflow caps at `u128::MAX` and

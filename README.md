@@ -29,8 +29,8 @@ of the underlying token.
 | `accrue_yield(amount)` | Admin-only mock yield accrual. |
 | `convert_to_shares(assets)` | Preview shares for a given asset amount. |
 | `convert_to_assets(shares)` | Preview assets for a given share amount. |
-| `preview_deposit(assets)` | ERC4626-style alias of `convert_to_shares`. |
-| `preview_withdraw(shares)` | ERC4626-style alias of `convert_to_assets`. |
+| `preview_deposit(assets)` | Invariant-checked deposit preview (same checks as `deposit`). |
+| `preview_withdraw(shares)` | Invariant-checked withdraw preview (zero/dust checks as `withdraw`). |
 | `price_per_share()` | Value of one share, scaled by `PRICE_SCALE`. |
 | `max_withdraw(user)` | Assets redeemable for a user's full balance. |
 | `max_redeem(user)` | Shares redeemable for a user (their balance). |
