@@ -1,0 +1,75 @@
+name: YieldVault withdrawal maximum acceptance
+on:
+  push:
+    branches: [validation/yvc87-maxima-relay47-20261004]
+permissions:
+  contents: write
+concurrency:
+  group: yvc87-maxima-relay47
+  cancel-in-progress: false
+jobs:
+  withdrawal-maxima:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      SOURCE: f7f7f3310571fb321295383c9d8979402083bb7c
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: carrier
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          path: subject
+          ref: f7f7f3310571fb321295383c9d8979402083bb7c
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: subject
+      - name: Execute the real contract before and after the repair
+        working-directory: subject
+        env:
+          EVIDENCE: ${{ runner.temp }}/yvc87-evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE"
+          test "$(git rev-parse HEAD)" = "$SOURCE"
+          test "$(git hash-object src/lib.rs)" = e4826041cb2cd16e62e7b93d7aa12074c870a32e
+          test "$(git hash-object src/test.rs)" = d4f971d344fba89323cdef40347473287db01499
+          ! grep -q test_max_withdraw_limit_ src/test.rs
+          { git rev-parse HEAD HEAD^{tree}; git hash-object src/lib.rs src/test.rs Cargo.lock; rustc --version; cargo --version; } > "$EVIDENCE/source.txt"
+          cat ../carrier/cases.rs >> src/test.rs
+          set +e
+          cargo test --locked --lib test_max_withdraw_limit_ -- --nocapture > "$EVIDENCE/before.log" 2>&1
+          before=$?
+          set -e
+          echo "$before" > "$EVIDENCE/before.exit"
+          cat "$EVIDENCE/before.log"
+          test "$before" = 101
+          grep -q 'test result: FAILED. 0 passed; 4 failed;' "$EVIDENCE/before.log"
+          python3 ../carrier/repair.py
+          rustfmt --edition 2021 --config skip_children=true src/lib.rs src/test.rs
+          git diff --check
+          cargo test --locked --lib test_max_withdraw_limit_ -- --nocapture 2>&1 | tee "$EVIDENCE/after.log"
+          grep -q 'test result: ok. 4 passed; 0 failed;' "$EVIDENCE/after.log"
+          git diff --exit-code -- Cargo.toml Cargo.lock rust-toolchain.toml src/storage.rs src/math.rs
+          test "$(git diff --name-only)" = "$(printf 'src/lib.rs\nsrc/test.rs')"
+          git diff -- src/lib.rs src/test.rs > "$EVIDENCE/source.patch"
+          cp src/lib.rs "$EVIDENCE/lib.rs"
+          cp src/test.rs "$EVIDENCE/test.rs"
+          git add src/lib.rs src/test.rs
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix(vault): align withdrawal maxima with active limits [skip ci]'
+          test "$(git rev-parse HEAD^)" = "$SOURCE"
+          { git rev-parse HEAD HEAD^{tree}; git hash-object src/lib.rs src/test.rs; git show --stat --oneline HEAD; } | tee "$EVIDENCE/candidate.txt"
+          git push origin HEAD:refs/heads/relay47/yvc87-maxima-candidate-20261004
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: yvc87-maxima-relay47
+          path: ${{ runner.temp }}/yvc87-evidence
+          retention-days: 14
+          if-no-files-found: error
