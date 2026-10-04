@@ -1,0 +1,41 @@
+name: Preview token range parity
+on:
+  push:
+    branches: [validation/yvc81-signed-range-280b-20261004]
+permissions:
+  contents: write
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: controller
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 477f418eac85d27be45358af7e2ffc6e514afca1
+          path: ttl
+      - name: Format only the already-passing TTL regression
+        run: python controller/preview_range.py format ttl results/ttl
+      - uses: actions/checkout@v4
+        with:
+          ref: 7bb2380b5c8c47b8a91f16329db737d698c41b06
+          path: preview
+      - name: Execute and repair token range parity
+        run: python controller/preview_range.py repair preview results/preview
+      - name: Preserve source and raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yvc81-range-and-yvc85-format-280b
+          path: |
+            results/
+            controller/preview_range.py
+          retention-days: 14
+          if-no-files-found: error
