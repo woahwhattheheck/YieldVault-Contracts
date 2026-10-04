@@ -44,13 +44,17 @@ jobs:
           import hashlib, json, os, subprocess
           from pathlib import Path
           changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
-          assert set(changed).issubset({'src/fuzz.rs'}), changed
-          data = Path('src/fuzz.rs').read_bytes()
-          source = data.decode('utf-8')
-          metadata = {'source_sha': os.environ['SOURCE_SHA'], 'git_blob': subprocess.check_output(['git', 'hash-object', 'src/fuzz.rs'], text=True).strip(), 'sha256': hashlib.sha256(data).hexdigest(), 'format_changed': changed}
+          paths = ['src/fuzz.rs', 'src/storage.rs']
+          assert set(changed).issubset(set(paths)), changed
+          metadata = {'source_sha': os.environ['SOURCE_SHA'], 'files': {}, 'format_changed': changed}
+          print('YVC84_STORAGE_FORMAT_DIFF=' + json.dumps(subprocess.check_output(['git', 'diff', '--', 'src/storage.rs'], text=True)))
+          for path in paths:
+              data = Path(path).read_bytes()
+              source = data.decode('utf-8')
+              metadata['files'][path] = {'git_blob': subprocess.check_output(['git', 'hash-object', path], text=True).strip(), 'sha256': hashlib.sha256(data).hexdigest()}
+              for start in range(0, len(source), 6000):
+                  print('YVC84_SOURCE_CHUNK=' + json.dumps({'path': path, 'chunk': source[start:start+6000]}))
           Path(os.environ['RUNNER_TEMP'], 'yvc84-formatted.json').write_text(json.dumps(metadata))
-          for start in range(0, len(source), 6000):
-              print('YVC84_SOURCE_CHUNK=' + json.dumps(source[start:start+6000]))
           print('YVC84_SOURCE_END=' + json.dumps(metadata))
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -66,7 +70,8 @@ jobs:
           import hashlib, json, os, subprocess
           from pathlib import Path
           metadata = json.loads(Path(os.environ['RUNNER_TEMP'], 'yvc84-formatted.json').read_text())
-          assert hashlib.sha256(Path('src/fuzz.rs').read_bytes()).hexdigest() == metadata['sha256']
+          for path, receipt in metadata['files'].items():
+              assert hashlib.sha256(Path(path).read_bytes()).hexdigest() == receipt['sha256'], path
           changed = subprocess.check_output(['git', 'diff', '--name-only', '--', 'src', 'Cargo.toml', 'Cargo.lock'], text=True).splitlines()
-          assert set(changed).issubset({'src/fuzz.rs'}), changed
+          assert set(changed).issubset(set(metadata['files'])), changed
           print('YVC84_TESTED_SOURCE=' + json.dumps(metadata))
