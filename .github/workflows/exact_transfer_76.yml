@@ -1,0 +1,44 @@
+name: Issue 76 exact transfer regression
+on:
+  push:
+    branches: [validation/kestrel1004-exact-transfer-76]
+    paths: [.github/workflows/exact_transfer_76.yml]
+permissions:
+  contents: read
+jobs:
+  exact-transfer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cb469ddd854171ed3e12b3c4abe5169aadfa26c4
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Record source and dependency identity
+        run: |
+          test "$(git rev-parse HEAD)" = cb469ddd854171ed3e12b3c4abe5169aadfa26c4
+          git rev-parse HEAD
+          rustc --version
+          cargo --version
+          sha256sum Cargo.lock src/lib.rs src/exact_transfer_test.rs
+      - name: Execute only the two exact-transfer regressions
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --lib test_exact_transfer_ -- --nocapture 2>&1 | tee "$RUNNER_TEMP/exact-transfer.log"
+      - name: Preserve result
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Issue 76 exact transfer regression'
+            echo 'Source: cb469ddd854171ed3e12b3c4abe5169aadfa26c4'
+            echo 'Only test_exact_transfer_ cases; no full-suite or deployment claim.'
+            echo '```text'
+            test ! -f "$RUNNER_TEMP/exact-transfer.log" || tail -50 "$RUNNER_TEMP/exact-transfer.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
