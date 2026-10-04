@@ -408,22 +408,25 @@ impl YieldVault {
         let rate_version = storage::get_yield_rate_version(env);
         let total_assets = storage::get_total_assets(env);
         let amount = math::simple_yield(total_assets, rate_bps, elapsed)?;
+        let new_total = total_assets.saturating_add(amount);
+        // Saturation can credit less than the calculated yield. Return and
+        // publish the actual storage delta so indexers do not overcount it.
+        let credited = new_total - total_assets;
 
         // Always advance the accrual boundary, even when amount == 0 (empty
         // vault or zero rate), so idle gaps do not later inflate a fresh
         // deposit unfairly beyond the max-interval clamp.
         storage::set_last_accrued_at(env, now);
 
-        if amount == 0 {
+        if credited == 0 {
             storage::extend_instance(env);
             return Ok(0);
         }
 
-        let new_total = total_assets.saturating_add(amount);
         storage::set_total_assets(env, new_total);
         storage::extend_instance(env);
-        events::accrue_yield(env, amount, new_total, now, rate_version);
-        Ok(amount)
+        events::accrue_yield(env, credited, new_total, now, rate_version);
+        Ok(credited)
     }
 
     /// Returns the contract's on-chain interface version.
