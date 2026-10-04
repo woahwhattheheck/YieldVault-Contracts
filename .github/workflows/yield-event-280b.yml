@@ -1,0 +1,41 @@
+name: Yield event credited amount
+on:
+  push:
+    branches: [validation/yvc88-yield-event-280b-20261004]
+permissions:
+  contents: write
+jobs:
+  event:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: controller
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 3ed5f5a13be1320120597bc07490b4113e7eb1a8
+          path: product
+      - name: Run original event regression and retain correction
+        run: python controller/yield_event.py event product results/event
+      - uses: actions/checkout@v4
+        with:
+          ref: fc2d4d5a5418ee8cc655fcbc7691cfc54d5800e0
+          path: preview
+      - name: Restore unchanged getter entry in preview guide
+        run: python controller/yield_event.py guide preview results/guide
+      - name: Retain source and execution logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yvc88-yield-event-280b
+          path: |
+            results/
+            controller/yield_event.py
+          retention-days: 14
+          if-no-files-found: error
