@@ -1,0 +1,51 @@
+name: TTL invocation isolation
+on:
+  push:
+    branches: [validation/yvc85-ttl-invocations-280b-20261004]
+permissions:
+  contents: write
+jobs:
+  ttl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: controller
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: woahwhattheheck/YieldVault-Contracts
+          ref: 096a5dc4416a6faa57fdd80f60952eb7dcd6e11e
+          path: product
+      - name: Exclude testutils-generated snapshots from source publication
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('controller/ttl_invocations.py')
+          old = "assert set(git('diff', '--name-only').splitlines()) == set(expected)"
+          new = """changed = set(git('diff', '--name-only').splitlines())
+          assert set(expected).issubset(changed)
+          generated = changed - set(expected)
+          assert all(p.startswith('test_snapshots/') and p.endswith('.json') for p in generated), generated
+          (out / 'generated-snapshots-not-published.json').write_text(json.dumps(sorted(generated), indent=2) + '\\n')"""
+          text = p.read_text()
+          assert text.count(old) == 1
+          p.write_text(text.replace(old, new))
+          PY
+      - name: Execute source-bound regression and retain candidate
+        run: python controller/ttl_invocations.py product results
+      - name: Retain actual source and execution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yvc85-ttl-invocations-280b
+          path: |
+            results/
+            controller/
+          if-no-files-found: error
+          retention-days: 14
