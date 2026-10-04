@@ -1,0 +1,121 @@
+name: Focused paused withdrawal limits
+on:
+  push:
+    branches: [validation/yvc82-paused-maxima-rivet1004]
+permissions:
+  contents: write
+jobs:
+  pause-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 2
+      SOURCE_SHA: 51392334965673feb3a5a2e590cfa8e5d8449bfb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 51392334965673feb3a5a2e590cfa8e5d8449bfb
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: yvc82-pause
+      - name: Apply the bounded getter and existing-test correction
+        shell: python
+        run: |
+          from pathlib import Path
+          import hashlib, os, subprocess
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == os.environ['SOURCE_SHA']
+          def replace_one(text, before, after):
+              assert text.count(before) == 1, repr(before)
+              return text.replace(before, after, 1)
+          p = Path('src/lib.rs')
+          data = p.read_bytes()
+          assert hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest() == 'd4b68c6785ee11191524305f7e2da520bfb4c4b8'
+          text = data.decode()
+          text = replace_one(text,
+              '    /// Returns the amount of underlying assets `user` could withdraw by\n    /// redeeming their entire share balance at the current exchange rate.\n',
+              '    /// Returns the amount of underlying assets `user` can currently withdraw.\n    ///\n    /// Returns zero while paused. Use [`Self::convert_to_assets`] or\n    /// [`Self::preview_withdraw`] to inspect the position value during a pause.\n')
+          text = replace_one(text,
+              '    pub fn max_withdraw(env: Env, user: Address) -> Result<u128, Error> {\n',
+              '    pub fn max_withdraw(env: Env, user: Address) -> Result<u128, Error> {\n        if storage::is_paused(&env) {\n            return Ok(0);\n        }\n')
+          text = replace_one(text,
+              '    /// Returns the maximum number of shares `user` can redeem, which is simply\n    /// their current share balance.\n',
+              '    /// Returns the maximum number of shares `user` can currently redeem.\n    ///\n    /// Returns zero while paused; [`Self::balance_of`] still reports ownership.\n')
+          text = replace_one(text,
+              '    pub fn max_redeem(env: Env, user: Address) -> u128 {\n',
+              '    pub fn max_redeem(env: Env, user: Address) -> u128 {\n        if storage::is_paused(&env) {\n            return 0;\n        }\n')
+          p.write_text(text)
+          p = Path('src/test.rs')
+          text = p.read_text()
+          start = text.index('fn test_pause_does_not_block_readonly_getters() {')
+          end = text.index('\n#[test]', start)
+          body = text[start:end]
+          body = replace_one(body,
+              '    t.vault\n        .set_paused(&true, &Symbol::new(&t.env, "maintenance"));',
+              '    assert_eq!(t.vault.max_withdraw(&user), 1_000);\n    assert_eq!(t.vault.max_redeem(&user), shares);\n\n    t.vault\n        .set_paused(&true, &Symbol::new(&t.env, "maintenance"));')
+          # Only the assertions after pause change; the new pre-pause controls remain.
+          pivot = body.index('    // Every listed read-only path')
+          prefix, paused = body[:pivot], body[pivot:]
+          paused = replace_one(paused, '    assert_eq!(t.vault.max_withdraw(&user), 1_000);', '    assert_eq!(t.vault.max_withdraw(&user), 0);')
+          paused = replace_one(paused, '    assert_eq!(t.vault.max_redeem(&user), shares);', '    assert_eq!(t.vault.max_redeem(&user), 0);')
+          tail = '    assert!(t.vault.is_paused());\n    assert_eq!(t.vault.total_assets(), 1_000);\n}'
+          replacement = '    assert!(t.vault.is_paused());\n    assert_eq!(t.vault.total_assets(), 1_000);\n    assert_eq!(t.vault.balance_of(&user), shares);\n\n    // Resuming restores executable limits without rewriting the position.\n    t.vault.set_paused(&false, &Symbol::new(&t.env, "resume"));\n    assert_eq!(t.vault.max_withdraw(&user), 1_000);\n    assert_eq!(t.vault.max_redeem(&user), shares);\n    assert_eq!(t.vault.balance_of(&user), shares);\n}'
+          paused = replace_one(paused, tail, replacement)
+          text = text[:start] + prefix + paused + text[end:]
+          p.write_text(text)
+          p = Path('README.md')
+          text = p.read_text()
+          before = 'can inspect state and recover.\n'
+          after = before + '\nWhile paused, `max_withdraw` and `max_redeem` report zero: no withdrawal is\ncurrently executable. `balance_of`, conversion methods, and previews still\nreport the unchanged position and exchange rate. Unpausing restores the\nwithdrawal maxima without changing balances.\n'
+          p.write_text(replace_one(text, before, after))
+      - name: Execute only the existing pause selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          rustc --version | tee evidence/rustc.txt
+          cargo --version | tee evidence/cargo.txt
+          cargo test --locked test_pause -- --nocapture 2>&1 | tee evidence/pause-tests.log
+      - name: Retain a source-only candidate for native publication
+        shell: python
+        env:
+          CANDIDATE_REF: delivery/yvc82-paused-maxima-rivet1004
+        run: |
+          import hashlib, json, os, re, subprocess
+          from pathlib import Path
+          log = Path('evidence/pause-tests.log').read_text()
+          names = ['test_pause_blocks_all_value_moving_ops', 'test_paused_event_payload', 'test_pause_does_not_block_readonly_getters']
+          for name in names:
+              assert re.search(r'test (?:\w+::)*'+name+r' \.\.\. ok', log), name
+          assert re.search(r'test result: ok\. \d+ passed; 0 failed;', log)
+          paths = ['src/lib.rs', 'src/test.rs', 'README.md']
+          run_url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          note = '\nThe pause-limit follow-up was checked with `cargo test --locked test_pause -- --nocapture`\nusing the existing three pause tests. This is a focused native Soroban-host result,\nnot a full-suite or live-chain result. [Execution log]('+run_url+').\n'
+          with Path('README.md').open('a') as output:
+              output.write(note)
+          subprocess.run(['git', 'add', '--'] + paths, check=True)
+          actual = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
+          assert set(actual) == set(paths), actual
+          author = subprocess.check_output(['git', 'show', '-s', '--format=%an'], text=True).strip()
+          email = subprocess.check_output(['git', 'show', '-s', '--format=%ae'], text=True).strip()
+          subprocess.run(['git', 'config', 'user.name', author], check=True)
+          subprocess.run(['git', 'config', 'user.email', email], check=True)
+          subprocess.run(['git', 'commit', '-m', 'fix: report zero withdrawal limits while paused', '-m', 'Keep ownership and exchange-rate previews readable while respecting the full withdrawal pause. Extend the existing pause inspection test with pre-pause, paused and resumed limits. Three existing pause tests passed using the locked native Soroban test host. No full suite, live-chain call, or change to transfer/admin behavior.\n\nExecution: '+run_url], check=True)
+          head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+          changed = subprocess.check_output(['git', 'diff', '--name-only', os.environ['SOURCE_SHA'], head], text=True).splitlines()
+          assert set(changed) == set(paths), changed
+          manifest = {'parent': os.environ['SOURCE_SHA'], 'candidate': head, 'tree': tree, 'run_url': run_url, 'command': 'cargo test --locked test_pause -- --nocapture', 'selected_tests': names, 'files': {p: {'git_blob': subprocess.check_output(['git', 'rev-parse', 'HEAD:'+p], text=True).strip(), 'sha256': hashlib.sha256(Path(p).read_bytes()).hexdigest()} for p in paths}}
+          Path('evidence/receipt.json').write_text(json.dumps(manifest, indent=2)+'\n')
+          Path('evidence/change.diff').write_bytes(subprocess.check_output(['git', 'diff', os.environ['SOURCE_SHA'], head, '--']+paths))
+          # Publish a new candidate reference only. The original PR is advanced separately.
+          subprocess.run(['git', 'push', 'origin', 'HEAD:refs/heads/'+os.environ['CANDIDATE_REF']], check=True)
+          print(json.dumps(manifest, indent=2))
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: yvc82-paused-maxima-evidence
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: warn
